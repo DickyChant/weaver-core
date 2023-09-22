@@ -11,6 +11,7 @@ import numpy as np
 import math
 import copy
 import torch
+from torch import nn
 
 from torch.utils.data import DataLoader
 from weaver.utils.logger import _logger, _configLogger
@@ -20,6 +21,8 @@ from weaver.utils.import_tools import import_module
 parser = argparse.ArgumentParser()
 parser.add_argument('--regression-mode', action='store_true', default=False,
                     help='run in regression mode if this flag is set; otherwise run in classification mode')
+parser.add_argument("--kd-mode", action="store_true", default=False,
+                    help="run in knowledge distillation mode if this flag is set; otherwise run in normal mode")
 parser.add_argument('-c', '--data-config', type=str,
                     help='data config YAML file')
 parser.add_argument('--extra-selection', type=str, default=None,
@@ -78,6 +81,8 @@ parser.add_argument('-m', '--model-prefix', type=str, default='models/{auto}/net
                          'based on the timestamp and network configuration')
 parser.add_argument('--load-model-weights', type=str, default=None,
                     help='initialize model with pre-trained weights')
+parser.add_argument('--load-teacher-weights', type=str, default=None,
+                    help='initialize teacher model with pre-trained weights')
 parser.add_argument('--exclude-model-weights', type=str, default=None,
                     help='comma-separated regex to exclude matched weights from being loaded, e.g., `a.fc..+,b.fc..+`')
 parser.add_argument('--num-epochs', type=int, default=20,
@@ -140,7 +145,8 @@ parser.add_argument('--backend', type=str, choices=['gloo', 'nccl', 'mpi'], defa
                     help='backend for distributed training')
 parser.add_argument('--cross-validation', type=str, default=None,
                     help='enable k-fold cross validation; input format: `variable_name%k`')
-
+parser.add_argument('--jit-output',type=str,default=None,
+                    help='path to save the jit model')
 
 def to_filelist(args, mode='train'):
     if mode == 'train':
@@ -581,15 +587,32 @@ def model_setup(args, data_config):
                      (args.load_model_weights, missing_keys, unexpected_keys))
     # _logger.info(model)
     flops(model, model_info)
+    if args.kd_mode:
+        teacher_model, teacher_model_info = network_module.get_teacher_model(data_config, **network_options)
+        _logger.info(teacher_model)
+        with open("test.txt","w") as fout:
+            fout.write(str(teacher_model.state_dict()))
+        teacher_model_state = torch.load(args.load_teacher_weights, map_location='cpu')        
+        teacher_missing_keys, teacher_unexpected_keys = teacher_model.load_state_dict(teacher_model_state, strict=False)
+        _logger.info('Teacher model initialized with weights from %s\n ... Missing: %s\n ... Unexpected: %s' %
+                        (args.load_teacher_weights, teacher_missing_keys, teacher_unexpected_keys))
     # loss function
-    try:
+    if args.kd_mode:
         loss_func = network_module.get_loss(data_config, **network_options)
         _logger.info('Using loss function %s with options %s' % (loss_func, network_options))
-    except AttributeError:
-        loss_func = torch.nn.CrossEntropyLoss()
-        _logger.warning('Loss function not defined in %s. Will use `torch.nn.CrossEntropyLoss()` by default.',
-                        args.network_config)
-    return model, model_info, loss_func
+    else:
+        try:
+            loss_func = network_module.get_loss(data_config, **network_options)
+            _logger.info('Using loss function %s with options %s' % (loss_func, network_options))
+        except AttributeError:
+            loss_func = torch.nn.CrossEntropyLoss()
+            _logger.warning('Loss function not defined in %s. Will use `torch.nn.CrossEntropyLoss()` by default.',
+                            args.network_config)
+    
+    if args.kd_mode:
+        return model, model_info,  teacher_model, teacher_model_info,loss_func
+    else:
+        return model, model_info, loss_func
 
 
 def iotest(args, data_loader):
@@ -681,6 +704,10 @@ def _main(args):
         _logger.info('Running in regression mode')
         from weaver.utils.nn.tools import train_regression as train
         from weaver.utils.nn.tools import evaluate_regression as evaluate
+    elif args.kd_mode:
+        _logger.info('Running in knowledge distillation mode')
+        from weaver.utils.nn.tools import train_classification_kd as train
+        from weaver.utils.nn.tools import evaluate_classification as evaluate
     else:
         _logger.info('Running in classification mode')
         from weaver.utils.nn.tools import train_classification as train
@@ -721,8 +748,13 @@ def _main(args):
         data_loader = train_loader if training_mode else list(test_loaders.values())[0]()
         iotest(args, data_loader)
         return
+    if args.kd_mode:
+        model, model_info, teacher_model, teacher_model_info, loss_func = model_setup(args, data_config)
+    else:
+        model, model_info, loss_func = model_setup(args, data_config)
 
-    model, model_info, loss_func = model_setup(args, data_config)
+    # if args.kd_mode:
+    #     teacher_model, teacher_model_info, teacher_loss_func = model_setup(args, data_config)
 
     # TODO: load checkpoint
     # if args.backend is not None:
@@ -745,13 +777,19 @@ def _main(args):
     # so we do not convert it to nn.DataParallel now
     orig_model = model
 
+
     if training_mode:
         model = orig_model.to(dev)
-
+        if args.kd_mode:
+            original_teacher_model = teacher_model
+            teacher_model = original_teacher_model.to(dev)
         # DistributedDataParallel
         if args.backend is not None:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=gpus, output_device=local_rank)
+            if args.kd_mode:
+                teacher_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(teacher_model)
+                teacher_model = torch.nn.parallel.DistributedDataParallel(teacher_model, device_ids=gpus, output_device=local_rank)
 
         # optimizer & learning rate
         opt, scheduler = optim(args, model, dev)
@@ -761,6 +799,8 @@ def _main(args):
             if gpus is not None and len(gpus) > 1:
                 # model becomes `torch.nn.DataParallel` w/ model.module being the original `torch.nn.Module`
                 model = torch.nn.DataParallel(model, device_ids=gpus)
+                if args.kd_mode:
+                    teacher_model = torch.nn.DataParallel(teacher_model, device_ids=gpus)
             # model = model.to(dev)
 
         # lr finder: keep it after all other setups
@@ -772,7 +812,9 @@ def _main(args):
             lr_finder.range_test(train_loader, start_lr=float(start_lr), end_lr=float(end_lr), num_iter=int(num_iter))
             lr_finder.plot(output='lr_finder.png')  # to inspect the loss-learning rate graph
             return
-
+        if args.kd_mode:
+            _logger.info("evaluate teacher")
+            evaluate(teacher_model, val_loader, dev, 0, loss_func=nn.CrossEntropyLoss(),steps_per_epoch=args.steps_per_epoch_val, tb_helper=None)
         # training loop
         best_valid_metric = np.inf if args.regression_mode else 0
         grad_scaler = torch.cuda.amp.GradScaler() if args.use_amp else None
@@ -782,8 +824,13 @@ def _main(args):
                     continue
             _logger.info('-' * 50)
             _logger.info('Epoch #%d training' % epoch)
-            train(model, loss_func, opt, scheduler, train_loader, dev, epoch,
-                  steps_per_epoch=args.steps_per_epoch, grad_scaler=grad_scaler, tb_helper=tb)
+            if args.kd_mode:
+
+                train(model, teacher_model, loss_func, opt, scheduler, train_loader, dev, epoch,
+                      steps_per_epoch=args.steps_per_epoch, grad_scaler=grad_scaler, tb_helper=tb)
+            else:
+                train(model, loss_func, opt, scheduler, train_loader, dev, epoch,
+                    steps_per_epoch=args.steps_per_epoch, grad_scaler=grad_scaler, tb_helper=tb)
             if args.model_prefix and (args.backend is None or local_rank == 0):
                 dirname = os.path.dirname(args.model_prefix)
                 if dirname and not os.path.exists(dirname):
@@ -797,8 +844,12 @@ def _main(args):
             #     save_checkpoint()
 
             _logger.info('Epoch #%d validating' % epoch)
-            valid_metric = evaluate(model, val_loader, dev, epoch, loss_func=loss_func,
+            if args.kd_mode:
+                valid_metric = evaluate(model, val_loader, dev, epoch, loss_func=nn.CrossEntropyLoss(),
                                     steps_per_epoch=args.steps_per_epoch_val, tb_helper=tb)
+            else:
+                valid_metric = evaluate(model, val_loader, dev, epoch, loss_func=loss_func,
+                                        steps_per_epoch=args.steps_per_epoch_val, tb_helper=tb)
             is_best_epoch = (
                 valid_metric < best_valid_metric) if args.regression_mode else(
                 valid_metric > best_valid_metric)
@@ -810,7 +861,9 @@ def _main(args):
                     # torch.save(model, args.model_prefix + '_best_epoch_full.pt')
             _logger.info('Epoch #%d: Current validation metric: %.5f (best: %.5f)' %
                          (epoch, valid_metric, best_valid_metric), color='bold')
-
+    if args.jit_output is not None:
+        model_jit = torch.jit.script(model)
+        model_jit.save(args.jit_output)
     if args.data_test:
         if args.backend is not None and local_rank != 0:
             return

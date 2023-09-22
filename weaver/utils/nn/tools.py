@@ -29,6 +29,93 @@ def _flatten_preds(preds, mask=None, label_axis=1):
     # print('preds', preds.shape, preds)
     return preds
 
+def train_classification_kd(model,teacher_model, loss_func, opt, scheduler, train_loader, dev, epoch, steps_per_epoch=None, grad_scaler=None, tb_helper=None):
+    model.train()
+
+    data_config = train_loader.dataset.config
+
+    label_counter = Counter()
+    total_loss = 0
+    num_batches = 0
+    total_correct = 0
+    count = 0
+    start_time = time.time()
+    with tqdm.tqdm(train_loader) as tq:
+        for X, y, _ in tq:
+            inputs = [X[k].to(dev) for k in data_config.input_names]
+            label = y[data_config.label_names[0]].long()
+            try:
+                label_mask = y[data_config.label_names[0] + '_mask'].bool()
+            except KeyError:
+                label_mask = None
+            label = _flatten_label(label, label_mask)
+            num_examples = label.shape[0]
+            label_counter.update(label.cpu().numpy())
+            label = label.to(dev)
+            opt.zero_grad()
+            with torch.cuda.amp.autocast(enabled=grad_scaler is not None):
+                model_output = model(*inputs)
+                teacher_model_output = teacher_model(*inputs)
+                logits = _flatten_preds(model_output, label_mask)
+                teacher_logits = _flatten_preds(teacher_model_output, label_mask)
+                loss = loss_func(logits,teacher_logits, label)
+            if grad_scaler is None:
+                loss.backward()
+                opt.step()
+            else:
+                grad_scaler.scale(loss).backward()
+                grad_scaler.step(opt)
+                grad_scaler.update()
+
+            if scheduler and getattr(scheduler, '_update_per_step', False):
+                scheduler.step()
+
+            _, preds = logits.max(1)
+            loss = loss.item()
+
+            num_batches += 1
+            count += num_examples
+            correct = (preds == label).sum().item()
+            total_loss += loss
+            total_correct += correct
+
+            tq.set_postfix({
+                'lr': '%.2e' % scheduler.get_last_lr()[0] if scheduler else opt.defaults['lr'],
+                'Loss': '%.5f' % loss,
+                'AvgLoss': '%.5f' % (total_loss / num_batches),
+                'Acc': '%.5f' % (correct / num_examples),
+                'AvgAcc': '%.5f' % (total_correct / count)})
+
+            if tb_helper:
+                tb_helper.write_scalars([
+                    ("Loss/train", loss, tb_helper.batch_train_count + num_batches),
+                    ("Acc/train", correct / num_examples, tb_helper.batch_train_count + num_batches),
+                    ])
+                if tb_helper.custom_fn:
+                    with torch.no_grad():
+                        tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=num_batches, mode='train')
+
+            if steps_per_epoch is not None and num_batches >= steps_per_epoch:
+                break
+
+    time_diff = time.time() - start_time
+    _logger.info('Processed %d entries in total (avg. speed %.1f entries/s)' % (count, count / time_diff))
+    _logger.info('Train AvgLoss: %.5f, AvgAcc: %.5f' % (total_loss / num_batches, total_correct / count))
+    _logger.info('Train class distribution: \n    %s', str(sorted(label_counter.items())))
+
+    if tb_helper:
+        tb_helper.write_scalars([
+            ("Loss/train (epoch)", total_loss / num_batches, epoch),
+            ("Acc/train (epoch)", total_correct / count, epoch),
+            ])
+        if tb_helper.custom_fn:
+            with torch.no_grad():
+                tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=-1, mode='train')
+        # update the batch state
+        tb_helper.batch_train_count += num_batches
+
+    if scheduler and not getattr(scheduler, '_update_per_step', False):
+        scheduler.step()
 
 def train_classification(model, loss_func, opt, scheduler, train_loader, dev, epoch, steps_per_epoch=None, grad_scaler=None, tb_helper=None):
     model.train()
@@ -115,7 +202,6 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
 
     if scheduler and not getattr(scheduler, '_update_per_step', False):
         scheduler.step()
-
 
 def evaluate_classification(model, test_loader, dev, epoch, for_training=True, loss_func=None, steps_per_epoch=None,
                             eval_metrics=['roc_auc_score', 'roc_auc_score_matrix', 'confusion_matrix'],

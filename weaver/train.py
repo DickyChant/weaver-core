@@ -588,7 +588,10 @@ def model_setup(args, data_config):
     # _logger.info(model)
     flops(model, model_info)
     if args.kd_mode:
-        teacher_model, teacher_model_info = network_module.get_teacher_model(data_config, **network_options)
+        from copy import deepcopy
+        teacher_model_options = deepcopy(network_options)
+        teacher_model_options['use_amp'] = False
+        teacher_model, teacher_model_info = network_module.get_teacher_model(data_config, **teacher_model_options)
         _logger.info(teacher_model)
         with open("test.txt","w") as fout:
             fout.write(str(teacher_model.state_dict()))

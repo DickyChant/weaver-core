@@ -31,7 +31,7 @@ def get_model_complexity_info(model, inputs,
     flops_model.eval()
     flops_model.start_flops_count(ost=ost, verbose=verbose,
                                   ignore_list=ignore_modules)
-
+    print(inputs)
     _ = flops_model(*inputs)
 
     flops_count, params_count = flops_model.compute_average_flops_cost()

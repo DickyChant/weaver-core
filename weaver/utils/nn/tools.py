@@ -185,6 +185,7 @@ def train_classification(model, loss_func, opt, scheduler, train_loader, dev, ep
                 break
 
     time_diff = time.time() - start_time
+    print(num_batches, count)
     _logger.info('Processed %d entries in total (avg. speed %.1f entries/s)' % (count, count / time_diff))
     _logger.info('Train AvgLoss: %.5f, AvgAcc: %.5f' % (total_loss / num_batches, total_correct / count))
     _logger.info('Train class distribution: \n    %s', str(sorted(label_counter.items())))

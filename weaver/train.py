@@ -258,6 +258,11 @@ def train_load(args):
                                  infinity_mode=args.steps_per_epoch_val is not None,
                                  in_memory=args.in_memory,
                                  name='val' + ('' if args.local_rank is None else '_rank%d' % args.local_rank))
+    print(min(args.num_workers, int(len(train_files) * args.file_fraction)))
+    print(args.num_workers)
+    print(len(train_files))
+    print(args.file_fraction)
+    print(int(len(train_files) * args.file_fraction))
     train_loader = DataLoader(train_data, batch_size=args.batch_size, drop_last=True, pin_memory=True,
                               num_workers=min(args.num_workers, int(len(train_files) * args.file_fraction)),
                               persistent_workers=args.num_workers > 0 and args.steps_per_epoch is not None)
@@ -371,7 +376,7 @@ def flops(model, model_info):
 
     inputs = tuple(
         torch.ones(model_info['input_shapes'][k], dtype=torch.float32) for k in model_info['input_names'])
-
+    print('line 379', model_info['input_names'])
     macs, params = get_model_complexity_info(model, inputs, as_strings=True, print_per_layer_stat=True, verbose=True)
     _logger.info('{:<30}  {:<8}'.format('Computational complexity: ', macs))
     _logger.info('{:<30}  {:<8}'.format('Number of parameters: ', params))
@@ -744,6 +749,8 @@ def _main(args):
     # load data
     if training_mode:
         train_loader, val_loader, data_config, train_input_names, train_label_names = train_load(args)
+        print(train_loader)
+        print(val_loader)
     else:
         test_loaders, data_config = test_load(args)
 

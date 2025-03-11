@@ -19,9 +19,23 @@ def _flatten_label(label, mask=None):
     return label
 
 
-def _flatten_preds(preds, mask=None, label_axis=1):
+def _flatten_preds(model_output, label=None, mask=None, label_axis=1):
+    if not isinstance(model_output, tuple):
+        # `label` and `mask` are provided as function arguments
+        preds = model_output
+    else:
+        if len(model_output == 2):
+            # use `mask` from model_output instead
+            # `label` still provided as function argument
+            preds, mask = model_output
+        elif len(model_output == 3):
+            # use `label` and `mask` from model output
+            preds, label, mask = model_output
+
+    # preds: (N, num_classes); (N, num_classes, P)
+    # label: (N,);             (N, P)
+    # mask:  None;             (N, P) / (N, 1, P)
     if preds.ndim > 2:
-        # assuming axis=1 corresponds to the classes
         preds = preds.transpose(label_axis, -1).contiguous()
         preds = preds.view((-1, preds.shape[-1]))
         if mask is not None:
@@ -225,28 +239,30 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
     with torch.no_grad():
         with tqdm.tqdm(test_loader) as tq:
             for X, y, Z in tq:
+                # X, y: torch.Tensor; Z: ak.Array
                 inputs = [X[k].to(dev) for k in data_config.input_names]
-                label = y[data_config.label_names[0]].long()
+                label = y[data_config.label_names[0]].long().to(dev)
                 entry_count += label.shape[0]
                 try:
-                    label_mask = y[data_config.label_names[0] + '_mask'].bool()
+                    mask = y[data_config.label_names[0] + '_mask'].bool().to(dev)
                 except KeyError:
-                    label_mask = None
-                if not for_training and label_mask is not None:
-                    labels_counts.append(np.squeeze(label_mask.numpy().sum(axis=-1)))
-                label = _flatten_label(label, label_mask)
-                num_examples = label.shape[0]
-                label_counter.update(label.cpu().numpy())
-                label = label.to(dev)
+                    mask = None
                 model_output = model(*inputs)
-                logits = _flatten_preds(model_output, label_mask).float()
+                logits, label, mask = _flatten_preds(model_output, label=label, mask=mask)
+                scores.append(torch.softmax(logits.float(), dim=1).numpy(force=True))
 
-                scores.append(torch.softmax(logits, dim=1).detach().cpu().numpy())
+                if mask is not None:
+                    mask = mask.cpu()
                 for k, v in y.items():
-                    labels[k].append(_flatten_label(v, label_mask).cpu().numpy())
+                    labels[k].append(_flatten_label(v, mask).numpy(force=True))
                 if not for_training:
                     for k, v in Z.items():
-                        observers[k].append(v.cpu().numpy())
+                        observers[k].append(v)
+
+                num_examples = label.shape[0]
+                label_counter.update(label.numpy(force=True))
+                if not for_training and mask is not None:
+                    labels_counts.append(np.squeeze(mask.numpy(force=True).sum(axis=-1)))
 
                 _, preds = logits.max(1)
                 loss = 0 if loss_func is None else loss_func(logits, label).item()
@@ -266,14 +282,14 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
                 if tb_helper:
                     if tb_helper.custom_fn:
                         with torch.no_grad():
-                            tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=num_batches,
-                                                mode='eval' if for_training else 'test')
+                            tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch,
+                                                i_batch=num_batches, mode='eval' if for_training else 'test')
 
                 if steps_per_epoch is not None and num_batches >= steps_per_epoch:
                     break
 
     time_diff = time.time() - start_time
-    _logger.info('Processed %d entries in total (avg. speed %.1f entries/s)' % (count, count / time_diff))
+    _logger.info('Processed %d entries in total (avg. speed %.1f entries/s)' % (entry_count, entry_count / time_diff))
     _logger.info('Evaluation class distribution: \n    %s', str(sorted(label_counter.items())))
 
     if tb_helper:
@@ -281,7 +297,7 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
         tb_helper.write_scalars([
             ("Loss/%s (epoch)" % tb_mode, total_loss / count, epoch),
             ("Acc/%s (epoch)" % tb_mode, total_correct / count, epoch),
-            ])
+        ])
         if tb_helper.custom_fn:
             with torch.no_grad():
                 tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=-1, mode=tb_mode)
@@ -303,7 +319,7 @@ def evaluate_classification(model, test_loader, dev, epoch, for_training=True, l
                 for k, v in labels.items():
                     labels[k] = ak.unflatten(v, labels_counts)
             else:
-                assert(count % entry_count == 0)
+                assert (count % entry_count == 0)
                 scores = scores.reshape((entry_count, int(count / entry_count), -1)).transpose((1, 2))
                 for k, v in labels.items():
                     labels[k] = v.reshape((entry_count, -1))
@@ -326,8 +342,9 @@ def evaluate_onnx(model_path, test_loader, eval_metrics=['roc_auc_score', 'roc_a
     start_time = time.time()
     with tqdm.tqdm(test_loader) as tq:
         for X, y, Z in tq:
-            inputs = {k: v.cpu().numpy() for k, v in X.items()}
-            label = y[data_config.label_names[0]].cpu().numpy()
+            # X, y: torch.Tensor; Z: ak.Array
+            inputs = {k: v.numpy(force=True) for k, v in X.items()}
+            label = y[data_config.label_names[0]].numpy(force=True)
             num_examples = label.shape[0]
             label_counter.update(label)
             score = sess.run([], inputs)[0]
@@ -335,9 +352,9 @@ def evaluate_onnx(model_path, test_loader, eval_metrics=['roc_auc_score', 'roc_a
 
             scores.append(score)
             for k, v in y.items():
-                labels[k].append(v.cpu().numpy())
+                labels[k].append(v.numpy(force=True))
             for k, v in Z.items():
-                observers[k].append(v.cpu().numpy())
+                observers[k].append(v)
 
             correct = (preds == label).sum()
             total_correct += correct
@@ -360,7 +377,9 @@ def evaluate_onnx(model_path, test_loader, eval_metrics=['roc_auc_score', 'roc_a
     return total_correct / count, scores, labels, observers
 
 
-def train_regression(model, loss_func, opt, scheduler, train_loader, dev, epoch, steps_per_epoch=None, grad_scaler=None, tb_helper=None):
+def train_regression(
+        model, loss_func, opt, scheduler, train_loader, dev, epoch, steps_per_epoch=None, grad_scaler=None,
+        tb_helper=None):
     model.train()
 
     data_config = train_loader.dataset.config
@@ -419,10 +438,11 @@ def train_regression(model, loss_func, opt, scheduler, train_loader, dev, epoch,
                     ("Loss/train", loss, tb_helper.batch_train_count + num_batches),
                     ("MSE/train", sqr_err / num_examples, tb_helper.batch_train_count + num_batches),
                     ("MAE/train", abs_err / num_examples, tb_helper.batch_train_count + num_batches),
-                    ])
+                ])
                 if tb_helper.custom_fn:
                     with torch.no_grad():
-                        tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=num_batches, mode='train')
+                        tb_helper.custom_fn(model_output=model_output, model=model,
+                                            epoch=epoch, i_batch=num_batches, mode='train')
 
             if steps_per_epoch is not None and num_batches >= steps_per_epoch:
                 break
@@ -437,7 +457,7 @@ def train_regression(model, loss_func, opt, scheduler, train_loader, dev, epoch,
             ("Loss/train (epoch)", total_loss / num_batches, epoch),
             ("MSE/train (epoch)", sum_sqr_err / count, epoch),
             ("MAE/train (epoch)", sum_abs_err / count, epoch),
-            ])
+        ])
         if tb_helper.custom_fn:
             with torch.no_grad():
                 tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=-1, mode='train')
@@ -468,6 +488,7 @@ def evaluate_regression(model, test_loader, dev, epoch, for_training=True, loss_
     with torch.no_grad():
         with tqdm.tqdm(test_loader) as tq:
             for X, y, Z in tq:
+                # X, y: torch.Tensor; Z: ak.Array
                 inputs = [X[k].to(dev) for k in data_config.input_names]
                 label = y[data_config.label_names[0]].float()
                 num_examples = label.shape[0]
@@ -475,12 +496,12 @@ def evaluate_regression(model, test_loader, dev, epoch, for_training=True, loss_
                 model_output = model(*inputs)
                 preds = model_output.squeeze().float()
 
-                scores.append(preds.detach().cpu().numpy())
+                scores.append(preds.numpy(force=True))
                 for k, v in y.items():
-                    labels[k].append(v.cpu().numpy())
+                    labels[k].append(v.numpy(force=True))
                 if not for_training:
                     for k, v in Z.items():
-                        observers[k].append(v.cpu().numpy())
+                        observers[k].append(v)
 
                 loss = 0 if loss_func is None else loss_func(preds, label).item()
 
@@ -505,8 +526,8 @@ def evaluate_regression(model, test_loader, dev, epoch, for_training=True, loss_
                 if tb_helper:
                     if tb_helper.custom_fn:
                         with torch.no_grad():
-                            tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=num_batches,
-                                                mode='eval' if for_training else 'test')
+                            tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch,
+                                                i_batch=num_batches, mode='eval' if for_training else 'test')
 
                 if steps_per_epoch is not None and num_batches >= steps_per_epoch:
                     break
@@ -520,7 +541,7 @@ def evaluate_regression(model, test_loader, dev, epoch, for_training=True, loss_
             ("Loss/%s (epoch)" % tb_mode, total_loss / count, epoch),
             ("MSE/%s (epoch)" % tb_mode, sum_sqr_err / count, epoch),
             ("MAE/%s (epoch)" % tb_mode, sum_abs_err / count, epoch),
-            ])
+        ])
         if tb_helper.custom_fn:
             with torch.no_grad():
                 tb_helper.custom_fn(model_output=model_output, model=model, epoch=epoch, i_batch=-1, mode=tb_mode)

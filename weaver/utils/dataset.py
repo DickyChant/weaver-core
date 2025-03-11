@@ -8,10 +8,14 @@ import torch.utils.data
 from functools import partial
 from concurrent.futures.thread import ThreadPoolExecutor
 from .logger import _logger
-from .data.tools import _pad, _repeat_pad, _clip
+from .data.tools import _pad, _repeat_pad, _clip, _stack
 from .data.fileio import _read_files
 from .data.config import DataConfig, _md5
 from .data.preprocess import _apply_selection, _build_new_variables, _build_weights, AutoStandardizer, WeightMaker
+
+
+def _collate_awkward_array_fn(batch, *, collate_fn_map=None):
+    return _stack(batch, axis=0)
 
 
 def _finalize_inputs(table, data_config):
@@ -19,11 +23,7 @@ def _finalize_inputs(table, data_config):
     # copy observer variables before transformation
     for k in data_config.z_variables:
         if k in data_config.observer_names:
-            a = ak.to_numpy(table[k])
-            if a.dtype in (np.uint16, np.uint32, np.uint64):
-                # FIXME: hack as torch only supports float64, float32, float16, complex64, complex128, int64, int32, int16, int8, uint8, and bool
-                a = a.astype('int64')
-            output[k] = a
+            output[k] = table[k]  # ak.Array
     # copy labels
     for k in data_config.label_names:
         output[k] = ak.to_numpy(table[k])
@@ -47,10 +47,10 @@ def _finalize_inputs(table, data_config):
             output['_' + k] = ak.to_numpy(ak.values_astype(table[names[0]], 'float32'))
         else:
             output['_' + k] = ak.to_numpy(np.stack([ak.to_numpy(table[n]).astype('float32') for n in names], axis=1))
-    # copy monitor variables
+    # copy monitor variables (after transformation)
     for k in data_config.z_variables:
-        if k not in output:
-            output[k] = ak.to_numpy(table[k])
+        if k in data_config.monitor_variables:
+            output[k] = table[k]  # ak.Array
     return output
 
 
@@ -67,7 +67,7 @@ def _get_reweight_indices(weights, up_sample=True, max_resample=10, weight_scale
         all_indices = np.repeat(np.arange(len(weights)), n_repeats)
         randwgt = np.random.uniform(low=0, high=weight_scale, size=len(weights) * n_repeats)
         keep_indices = all_indices[randwgt < np.repeat(weights, n_repeats)]
-    return keep_indices.copy()
+    return copy.deepcopy(keep_indices)
 
 
 def _check_labels(table):
@@ -88,7 +88,8 @@ def _preprocess(table, data_config, options):
     if len(table) == 0:
         return []
     # define new variables
-    table = _build_new_variables(table, data_config.var_funcs)
+    aux_branches = data_config.train_aux_branches if options['training'] else data_config.test_aux_branches
+    table = _build_new_variables(table, {k: v for k, v in data_config.var_funcs.items() if k in aux_branches})
     # check labels
     if data_config.label_type == 'simple' and options['training']:
         _check_labels(table)
@@ -108,7 +109,8 @@ def _preprocess(table, data_config, options):
 
 
 def _load_next(data_config, filelist, load_range, options):
-    table = _read_files(filelist, data_config.load_branches, load_range, treename=data_config.treename,
+    load_branches = data_config.train_load_branches if options['training'] else data_config.test_load_branches
+    table = _read_files(filelist, load_branches, load_range, treename=data_config.treename,
                         branch_magic=data_config.branch_magic, file_magic=data_config.file_magic)
     table, indices = _preprocess(table, data_config, options)
     return table, indices
@@ -135,7 +137,7 @@ class _SimpleIter(object):
 
         self._seed = None
         worker_info = torch.utils.data.get_worker_info()
-        file_dict = self._init_file_dict.copy()
+        file_dict = copy.deepcopy(self._init_file_dict)
         if worker_info is not None:
             # in a worker process
             self._name += '_worker%d' % worker_info.id
@@ -156,7 +158,7 @@ class _SimpleIter(object):
     def restart(self):
         print('=== Restarting DataIter %s, seed=%s ===' % (self._name, self._seed))
         # re-shuffle filelist and load range if for training
-        filelist = self.worker_filelist.copy()
+        filelist = copy.deepcopy(self.worker_filelist)
         if self._sampler_options['shuffle']:
             np.random.shuffle(filelist)
         if self._file_fraction < 1:
@@ -260,11 +262,11 @@ class _SimpleIter(object):
 
     def get_data(self, i):
         # inputs
-        X = {k: self.table['_' + k][i].copy() for k in self._data_config.input_names}
+        X = {k: copy.deepcopy(self.table['_' + k][i]) for k in self._data_config.input_names}
         # labels
-        y = {k: self.table[k][i].copy() for k in self._data_config.label_names}
+        y = {k: copy.deepcopy(self.table[k][i]) for k in self._data_config.label_names}
         # observers / monitor variables
-        Z = {k: self.table[k][i].copy() for k in self._data_config.z_variables}
+        Z = {k: copy.deepcopy(self.table[k][i]) for k in self._data_config.z_variables}
         return X, y, Z
 
 
@@ -314,6 +316,10 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
             'weight_scale': weight_scale,
             'max_resample': max_resample,
         }
+
+        # ==== torch collate_fn map ====
+        from torch.utils.data._utils.collate import default_collate_fn_map
+        default_collate_fn_map.update({ak.Array: _collate_awkward_array_fn})
 
         if for_training:
             self._sampler_options.update(training=True, shuffle=True, reweight=True)

@@ -42,7 +42,7 @@ parser.add_argument('-t', '--data-test', nargs='*', default=[],
                     help='testing files; supported syntax:'
                          ' (a) plain list, `--data-test /path/to/a/* /path/to/b/*`;'
                          ' (b) keyword-based, `--data-test a:/path/to/a/* b:/path/to/b/*`, will produce output_a, output_b;'
-                         ' (c) split output per N input files, `--data-test a%10:/path/to/a/*`, will split per 10 input files')
+                         ' (c) split output per N input files, `--data-test a%%10:/path/to/a/*`, will split per 10 input files')
 parser.add_argument('--data-fraction', type=float, default=1,
                     help='fraction of events to load from each file; for training, the events are randomly selected for each epoch')
 parser.add_argument('--file-fraction', type=float, default=1,
@@ -74,7 +74,7 @@ parser.add_argument('-o', '--network-option', nargs=2, action='append', default=
                     help='options to pass to the model class constructor, e.g., `--network-option use_counts False`')
 parser.add_argument('-m', '--model-prefix', type=str, default='models/{auto}/network',
                     help='path to save or load the model; for training, this will be used as a prefix, so model snapshots '
-                         'will saved to `{model_prefix}_epoch-%d_state.pt` after each epoch, and the one with the best '
+                         'will saved to `{model_prefix}_epoch-%%d_state.pt` after each epoch, and the one with the best '
                          'validation metric to `{model_prefix}_best_epoch_state.pt`; for testing, this should be the full path '
                          'including the suffix, otherwise the one with the best validation metric will be used; '
                          'for training, `{auto}` can be used as part of the path to auto-generate a name, '
@@ -85,6 +85,8 @@ parser.add_argument('--load-teacher-weights', type=str, default=None,
                     help='initialize teacher model with pre-trained weights')
 parser.add_argument('--exclude-model-weights', type=str, default=None,
                     help='comma-separated regex to exclude matched weights from being loaded, e.g., `a.fc..+,b.fc..+`')
+parser.add_argument('--freeze-model-weights', type=str, default=None,
+                    help='comma-separated regex to freeze matched weights from being updated in the training, e.g., `a.fc..+,b.fc..+`')
 parser.add_argument('--num-epochs', type=int, default=20,
                     help='number of epochs')
 parser.add_argument('--steps-per-epoch', type=int, default=None,
@@ -109,7 +111,7 @@ parser.add_argument('--lr-scheduler', type=str, default='flat+decay',
 parser.add_argument('--warmup-steps', type=int, default=0,
                     help='number of warm-up steps, only valid for `flat+linear` and `flat+cos` lr schedulers')
 parser.add_argument('--load-epoch', type=int, default=None,
-                    help='used to resume interrupted training, load model and optimizer state saved in the `epoch-%d_state.pt` and `epoch-%d_optimizer.pt` files')
+                    help='used to resume interrupted training, load model and optimizer state saved in the `epoch-%%d_state.pt` and `epoch-%%d_optimizer.pt` files')
 parser.add_argument('--start-lr', type=float, default=5e-3,
                     help='start learning rate')
 parser.add_argument('--batch-size', type=int, default=128,
@@ -345,6 +347,8 @@ def onnx(args):
     model = model.cpu()
     model.eval()
 
+    if not os.path.dirname(args.export_onnx):
+        args.export_onnx = os.path.join(os.path.dirname(model_path), args.export_onnx)
     os.makedirs(os.path.dirname(args.export_onnx), exist_ok=True)
     inputs = tuple(
         torch.ones(model_info['input_shapes'][k], dtype=torch.float32) for k in model_info['input_names'])
@@ -360,7 +364,7 @@ def onnx(args):
     _logger.info('Preprocessing parameters saved to %s', preprocessing_json)
 
 
-def flops(model, model_info):
+def flops(model, model_info, device='cpu'):
     """
     Count FLOPs and params.
     :param args:
@@ -371,7 +375,7 @@ def flops(model, model_info):
     from weaver.utils.flops_counter import get_model_complexity_info
     import copy
 
-    model = copy.deepcopy(model).cpu()
+    model = copy.deepcopy(model).to(device)
     model.eval()
 
     inputs = tuple(
@@ -558,7 +562,7 @@ def optim(args, model, device):
     return opt, scheduler
 
 
-def model_setup(args, data_config):
+def model_setup(args, data_config, device='cpu'):
     """
     Loads the model
     :param args:
@@ -590,6 +594,19 @@ def model_setup(args, data_config):
         missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
         _logger.info('Model initialized with weights from %s\n ... Missing: %s\n ... Unexpected: %s' %
                      (args.load_model_weights, missing_keys, unexpected_keys))
+        if args.freeze_model_weights:
+            import re
+            freeze_patterns = args.freeze_model_weights.split(',')
+            for name, param in model.named_parameters():
+                freeze = False
+                for pattern in freeze_patterns:
+                    if re.match(pattern, name):
+                        freeze = True
+                        break
+                if freeze:
+                    param.requires_grad = False
+            _logger.info('The following weights has been frozen:\n - %s',
+                         '\n - '.join([name for name, p in model.named_parameters() if not p.requires_grad]))
     # _logger.info(model)
     flops(model, model_info)
     if args.kd_mode:
@@ -638,14 +655,16 @@ def iotest(args, data_loader):
 
     for X, y, Z in tqdm(data_loader):
         for k, v in Z.items():
-            monitor_info[k].append(v.cpu().numpy())
+            monitor_info[k].append(v)
     monitor_info = {k: _concat(v) for k, v in monitor_info.items()}
     if monitor_info:
-        monitor_output_path = 'weaver_monitor_info.pkl'
-        import pickle
-        with open(monitor_output_path, 'wb') as f:
-            pickle.dump(monitor_info, f)
-        _logger.info('Monitor info written to %s' % monitor_output_path)
+        monitor_output_path = 'weaver_monitor_info.parquet'
+        try:
+            import awkward as ak
+            ak.to_parquet(ak.Array(monitor_info), monitor_output_path, compression='LZ4', compression_level=4)
+            _logger.info('Monitor info written to %s' % monitor_output_path, color='bold')
+        except Exception as e:
+            _logger.error('Error when writing output parquet file: \n' + str(e))
 
 
 def save_root(args, output_path, data_config, scores, labels, observers):
@@ -657,28 +676,48 @@ def save_root(args, output_path, data_config, scores, labels, observers):
     :param observers
     :return:
     """
+    import awkward as ak
     from weaver.utils.data.fileio import _write_root
     output = {}
-    if args.regression_mode:
-        output[data_config.label_names[0]] = labels[data_config.label_names[0]]
-        output['output'] = scores
-    else:
+    if data_config.label_type == 'simple':
         for idx, label_name in enumerate(data_config.label_value):
             output[label_name] = (labels[data_config.label_names[0]] == idx)
             output['score_' + label_name] = scores[:, idx]
-    for k, v in labels.items():
-        if k == data_config.label_names[0]:
-            continue
-        if v.ndim > 1:
-            _logger.warning('Ignoring %s, not a 1d array.', k)
-            continue
-        output[k] = v
-    for k, v in observers.items():
-        if v.ndim > 1:
-            _logger.warning('Ignoring %s, not a 1d array.', k)
-            continue
-        output[k] = v
-    _write_root(output_path, output)
+    else:
+        if scores.ndim <= 2:
+            output['output'] = scores
+        elif scores.ndim == 3:
+            num_classes = len(scores[0, 0, :])
+            try:
+                names = data_config.labels['names']
+                assert (len(names) == num_classes)
+            except KeyError:
+                names = [f'class_{idx}' for idx in range(num_classes)]
+            for idx, label_name in enumerate(names):
+                output[label_name] = (labels[data_config.label_names[0]] == idx)
+                output['score_' + label_name] = scores[:, :, idx]
+        else:
+            output['output'] = scores
+    output.update(labels)
+    output.update(observers)
+
+    try:
+        _write_root(output_path, ak.Array(output))
+        _logger.info('Written output to %s' % output_path, color='bold')
+    except Exception as e:
+        _logger.error('Error when writing output ROOT file: \n' + str(e))
+
+    save_as_parquet = any(v.ndim > 2 for v in output.values())
+    if save_as_parquet:
+        try:
+            ak.to_parquet(
+                ak.Array(output),
+                output_path.replace('.root', '.parquet'),
+                compression='LZ4', compression_level=4)
+            _logger.info('Written alternative output file to %s' %
+                         output_path.replace('.root', '.parquet'), color='bold')
+        except Exception as e:
+            _logger.error('Error when writing output parquet file: \n' + str(e))
 
 
 def save_parquet(args, output_path, scores, labels, observers):
@@ -693,7 +732,11 @@ def save_parquet(args, output_path, scores, labels, observers):
     output = {'scores': scores}
     output.update(labels)
     output.update(observers)
-    ak.to_parquet(ak.Array(output), output_path, compression='LZ4', compression_level=4)
+    try:
+        ak.to_parquet(ak.Array(output), output_path, compression='LZ4', compression_level=4)
+        _logger.info('Written output to %s' % output_path, color='bold')
+    except Exception as e:
+        _logger.error('Error when writing output parquet file: \n' + str(e))
 
 
 def _main(args):
@@ -916,7 +959,7 @@ def _main(args):
             del test_loader
 
             if args.predict_output:
-                if '/' not in args.predict_output:
+                if not os.path.dirname(args.predict_output):
                     predict_output = os.path.join(
                         os.path.dirname(args.model_prefix),
                         'predict_output', args.predict_output)
@@ -932,7 +975,6 @@ def _main(args):
                     save_root(args, output_path, data_config, scores, labels, observers)
                 else:
                     save_parquet(args, output_path, scores, labels, observers)
-                _logger.info('Written output to %s' % output_path, color='bold')
 
 
 def main():

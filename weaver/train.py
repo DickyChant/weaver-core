@@ -80,6 +80,8 @@ parser.add_argument('--load-model-weights', type=str, default=None,
                     help='initialize model with pre-trained weights')
 parser.add_argument('--exclude-model-weights', type=str, default=None,
                     help='comma-separated regex to exclude matched weights from being loaded, e.g., `a.fc..+,b.fc..+`')
+parser.add_argument('--freeze-model-weights', type=str, default=None,
+                    help='comma-separated regex to freeze matched weights from being updated in the training, e.g., `a.fc..+,b.fc..+`')
 parser.add_argument('--num-epochs', type=int, default=20,
                     help='number of epochs')
 parser.add_argument('--steps-per-epoch', type=int, default=None,
@@ -302,14 +304,16 @@ def test_load(args):
     def get_test_loader(name):
         filelist = file_dict[name]
         _logger.info('Running on test file group %s with %d files:\n...%s', name, len(filelist), '\n...'.join(filelist))
-        num_workers = min(args.num_workers, len(filelist))
+        num_workers = min(args.num_workers, len(filelist), 1)  # cap at 1 to avoid memory duplication
+        test_fetch_step = getattr(args, 'fetch_step', 0.01)
+        _logger.info('Test data loading: fetch_step=%.4f (loading data in chunks to reduce memory)', test_fetch_step)
         test_data = SimpleIterDataset({name: filelist}, args.data_config, for_training=False,
                                       extra_selection=args.extra_test_selection,
                                       load_range_and_fraction=((0, 1), args.data_fraction),
-                                      fetch_by_files=True, fetch_step=1,
+                                      fetch_by_files=False, fetch_step=test_fetch_step,
                                       name='test_' + name)
         test_loader = DataLoader(test_data, num_workers=num_workers, batch_size=args.batch_size, drop_last=False,
-                                 pin_memory=True)
+                                 pin_memory=False)
         return test_loader
 
     test_loaders = {name: functools.partial(get_test_loader, name) for name in file_dict}
@@ -334,6 +338,8 @@ def onnx(args):
     model = model.cpu()
     model.eval()
 
+    if not os.path.dirname(args.export_onnx):
+        args.export_onnx = os.path.join(os.path.dirname(model_path), args.export_onnx)
     os.makedirs(os.path.dirname(args.export_onnx), exist_ok=True)
     inputs = tuple(
         torch.ones(model_info['input_shapes'][k], dtype=torch.float32) for k in model_info['input_names'])
@@ -349,7 +355,7 @@ def onnx(args):
     _logger.info('Preprocessing parameters saved to %s', preprocessing_json)
 
 
-def flops(model, model_info):
+def flops(model, model_info, device='cpu'):
     """
     Count FLOPs and params.
     :param args:
@@ -360,11 +366,11 @@ def flops(model, model_info):
     from weaver.utils.flops_counter import get_model_complexity_info
     import copy
 
-    model = copy.deepcopy(model).cpu()
+    model = copy.deepcopy(model).to(device)
     model.eval()
 
     inputs = tuple(
-        torch.ones(model_info['input_shapes'][k], dtype=torch.float32) for k in model_info['input_names'])
+        torch.ones(model_info['input_shapes'][k], dtype=torch.float32, device=device) for k in model_info['input_names'])
 
     macs, params = get_model_complexity_info(model, inputs, as_strings=True, print_per_layer_stat=True, verbose=True)
     _logger.info('{:<30}  {:<8}'.format('Computational complexity: ', macs))
@@ -547,7 +553,7 @@ def optim(args, model, device):
     return opt, scheduler
 
 
-def model_setup(args, data_config):
+def model_setup(args, data_config, device='cpu'):
     """
     Loads the model
     :param args:
@@ -579,8 +585,21 @@ def model_setup(args, data_config):
         missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
         _logger.info('Model initialized with weights from %s\n ... Missing: %s\n ... Unexpected: %s' %
                      (args.load_model_weights, missing_keys, unexpected_keys))
+        if args.freeze_model_weights:
+            import re
+            freeze_patterns = args.freeze_model_weights.split(',')
+            for name, param in model.named_parameters():
+                freeze = False
+                for pattern in freeze_patterns:
+                    if re.match(pattern, name):
+                        freeze = True
+                        break
+                if freeze:
+                    param.requires_grad = False
+            _logger.info('The following weights has been frozen:\n - %s',
+                         '\n - '.join([name for name, p in model.named_parameters() if not p.requires_grad]))
     # _logger.info(model)
-    flops(model, model_info)
+    flops(model, model_info, device=device)
     # loss function
     try:
         loss_func = network_module.get_loss(data_config, **network_options)
@@ -748,7 +767,7 @@ def _main(args):
         iotest(args, data_loader)
         return
 
-    model, model_info, loss_func = model_setup(args, data_config)
+    model, model_info, loss_func = model_setup(args, data_config, device=dev)
 
     # TODO: load checkpoint
     # if args.backend is not None:
@@ -777,7 +796,7 @@ def _main(args):
         # DistributedDataParallel
         if args.backend is not None:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=gpus, output_device=local_rank)
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=gpus, output_device=local_rank, find_unused_parameters=True)
 
         # optimizer & learning rate
         opt, scheduler = optim(args, model, dev)
@@ -879,7 +898,7 @@ def _main(args):
             del test_loader
 
             if args.predict_output:
-                if '/' not in args.predict_output:
+                if not os.path.dirname(args.predict_output):
                     predict_output = os.path.join(
                         os.path.dirname(args.model_prefix),
                         'predict_output', args.predict_output)

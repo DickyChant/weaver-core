@@ -88,7 +88,8 @@ def _preprocess(table, data_config, options):
     if len(table) == 0:
         return []
     # define new variables
-    table = _build_new_variables(table, data_config.var_funcs)
+    aux_branches = data_config.train_aux_branches if options['training'] else data_config.test_aux_branches
+    table = _build_new_variables(table, {k: v for k, v in data_config.var_funcs.items() if k in aux_branches})
     # check labels
     if data_config.label_type == 'simple' and options['training']:
         _check_labels(table)
@@ -108,7 +109,8 @@ def _preprocess(table, data_config, options):
 
 
 def _load_next(data_config, filelist, load_range, options):
-    table = _read_files(filelist, data_config.load_branches, load_range, treename=data_config.treename,
+    load_branches = data_config.train_load_branches if options['training'] else data_config.test_load_branches
+    table = _read_files(filelist, load_branches, load_range, treename=data_config.treename,
                         branch_magic=data_config.branch_magic, file_magic=data_config.file_magic)
     table, indices = _preprocess(table, data_config, options)
     return table, indices
@@ -317,8 +319,9 @@ class SimpleIterDataset(torch.utils.data.IterableDataset):
 
         # ==== torch collate_fn map ====
         from torch.utils.data._utils.collate import default_collate_fn_map
-        default_collate_fn_map.update({ak.Array: _collate_awkward_array_fn})
-
+        def _collate_bool_fn(batch, *, collate_fn_map=None):
+            return torch.tensor([bool(x) for x in batch], dtype=torch.bool)
+        default_collate_fn_map.update({ak.Array: _collate_awkward_array_fn, np.bool_: _collate_bool_fn, bool: _collate_bool_fn})
         if for_training:
             self._sampler_options.update(training=True, shuffle=True, reweight=True)
         else:

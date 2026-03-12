@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import awkward as ak
 import tqdm
@@ -595,8 +596,14 @@ class TensorboardHelper(object):
     def __init__(self, tb_comment, tb_custom_fn):
         self.tb_comment = tb_comment
         from torch.utils.tensorboard import SummaryWriter
-        self.writer = SummaryWriter(comment=self.tb_comment)
-        _logger.info('Create Tensorboard summary writer with comment %s' % self.tb_comment)
+        # If tb_comment looks like an absolute path, use it as log_dir so
+        # TensorBoard events are written there instead of under local runs/.
+        if os.path.isabs(tb_comment):
+            self.writer = SummaryWriter(log_dir=self.tb_comment)
+            _logger.info('Create Tensorboard summary writer at log_dir %s' % self.tb_comment)
+        else:
+            self.writer = SummaryWriter(comment=self.tb_comment)
+            _logger.info('Create Tensorboard summary writer with comment %s' % self.tb_comment)
 
         # initiate the batch state
         self.batch_train_count = 0  # deprecated

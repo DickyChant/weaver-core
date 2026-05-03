@@ -1,10 +1,28 @@
 import os
+import json
 import numpy as np
 import awkward as ak
 import tqdm
 import time
 import torch
 import torch.distributed as dist
+
+
+def _save_live_checkpoint(model, opt, args_obj, local_rank, epoch, step):
+    """Save an intra-epoch ('live') checkpoint to ${prefix}_live_*. Rank 0 only."""
+    if local_rank != 0:
+        return
+    prefix = getattr(args_obj, 'model_prefix', None)
+    if not prefix:
+        return
+    try:
+        torch.save(unwrap_model(model).state_dict(), prefix + "_live_state.pt")
+        torch.save(opt.state_dict(), prefix + "_live_optimizer.pt")
+        with open(prefix + "_live_meta.json", "w") as f:
+            json.dump({"epoch": int(epoch), "step": int(step)}, f)
+    except Exception:
+        # Non-fatal: a live ckpt failure shouldn't kill training.
+        pass
 
 from collections import defaultdict, Counter
 from .metrics import evaluate_metrics
@@ -137,6 +155,10 @@ def train_classification(
 
     enable_autocast, autocast_dtype = get_autocast_config(extra_args['args'])
 
+    args_obj = extra_args['args']
+    save_steps = getattr(args_obj, 'save_steps', 0)
+    live_local_rank = extra_args.get('local_rank', 0) if extra_args else 0
+
     start_time = time.time()
     with tqdm.tqdm(train_loader) as tq:
         for X, y, _ in tq:
@@ -198,6 +220,10 @@ def train_classification(
                     with torch.no_grad():
                         tb_helper.custom_fn(model_output=model_output, model=model,
                                             epoch=epoch, i_batch=num_batches, mode='train')
+
+            if save_steps and num_batches > 0 and num_batches % save_steps == 0:
+                _save_live_checkpoint(model, opt, args_obj, live_local_rank,
+                                      epoch=epoch, step=num_batches)
 
             if steps_per_epoch is not None and num_batches >= steps_per_epoch:
                 break

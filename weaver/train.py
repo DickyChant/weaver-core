@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import os
+import json
 import ast
 import sys
 import shutil
@@ -130,6 +131,8 @@ parser.add_argument('--warmup-steps', type=float, default=0.25,
                     help='number of warm-up steps (or fraction of the total steps if <1), only valid for `flat+linear` and `flat+cos` lr schedulers')
 parser.add_argument('--load-epoch', type=int, default=None,
                     help='used to resume interrupted training, load model and optimizer state saved in the `epoch-%%d_state.pt` and `epoch-%%d_optimizer.pt` files')
+parser.add_argument('--save-steps', type=int, default=0,
+                    help='if >0, save an intra-epoch "live" checkpoint every N optimizer steps (rank 0 only). On restart, weaver auto-loads `model_prefix_live_state.pt` if present (overrides --load-epoch). The live file is deleted at the end of each completed epoch.')
 parser.add_argument('--start-lr', type=float, default=5e-3,
                     help='start learning rate')
 parser.add_argument('--batch-size', type=int, default=128,
@@ -601,7 +604,14 @@ def init_opt(args, model, **optimizer_options):
     else:
         opt = getattr(torch.optim, args.optimizer)(parameters, lr=args.start_lr, **optimizer_options)
 
-    if args.load_epoch is not None:
+    # Live (intra-epoch) checkpoint takes priority over --load-epoch.
+    live_epoch = maybe_load_live_checkpoint(args, model, opt)
+    if live_epoch is not None:
+        # Pretend the previous epoch was completed so the scheduler / epoch loop
+        # resumes correctly. The model & optimizer state already reflect partial
+        # progress through `live_epoch`; the data loader restarts from step 0.
+        args.load_epoch = live_epoch - 1 if live_epoch > 0 else None
+    elif args.load_epoch is not None:
         load_checkpoint(args, model, opt)
 
     opt._clip_grad_norm = clip_grad_norm
@@ -705,6 +715,61 @@ def load_checkpoint(args, model, opt):
         opt.load_state_dict(opt_state)
     else:
         _logger.warning("Optimizer state file %s NOT found!" % opt_state_file)
+
+
+def maybe_load_live_checkpoint(args, model, opt):
+    """If `${model_prefix}_live_state.pt` exists, load model + optimizer state
+    from it and return the epoch number recorded in the meta file (or 0 if
+    missing). Returns None if no live checkpoint is found.
+    """
+    if not args.model_prefix:
+        return None
+    live_state = args.model_prefix + "_live_state.pt"
+    if not os.path.exists(live_state):
+        return None
+    meta_path = args.model_prefix + "_live_meta.json"
+    epoch = 0
+    step = 0
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            epoch = int(meta.get("epoch", 0))
+            step = int(meta.get("step", 0))
+        except Exception as e:
+            _logger.warning("Could not parse %s: %s" % (meta_path, e))
+    _logger.info("Found live checkpoint at epoch %d, step %d — resuming epoch %d "
+                 "from start with loaded weights/optimizer state" % (epoch, step, epoch))
+    try:
+        model.load_state_dict(torch.load(live_state, map_location="cpu"))
+    except Exception as e:
+        _logger.error("Failed to load live model state from %s: %s" % (live_state, e))
+        return None
+    live_opt = args.model_prefix + "_live_optimizer.pt"
+    if os.path.exists(live_opt):
+        try:
+            opt.load_state_dict(torch.load(live_opt, map_location="cpu"))
+        except Exception as e:
+            _logger.warning("Failed to load live optimizer state: %s" % e)
+    else:
+        _logger.warning("Live optimizer file %s NOT found — optimizer state will be reset." % live_opt)
+    return epoch
+
+
+def cleanup_live_checkpoint(model_prefix):
+    """Delete the live checkpoint files, if any. Called after an epoch
+    completes successfully, since the per-epoch checkpoint is now authoritative.
+    """
+    if not model_prefix:
+        return
+    for fname in [model_prefix + "_live_state.pt",
+                  model_prefix + "_live_optimizer.pt",
+                  model_prefix + "_live_meta.json"]:
+        if os.path.exists(fname):
+            try:
+                os.remove(fname)
+            except OSError:
+                pass
 
 
 def model_setup(args, data_config, device="cpu"):
@@ -1070,6 +1135,8 @@ def _main(args):
                                 os.remove(f)
                             except OSError:
                                 pass
+                    # Stale live checkpoint: per-epoch checkpoint is now authoritative.
+                    cleanup_live_checkpoint(args.model_prefix)
 
             if "val" in args.run_mode:
                 _logger.info("Epoch #%d validating" % epoch)

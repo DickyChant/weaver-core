@@ -59,8 +59,15 @@ def _get_content_and_offsets(a):
     """Extract flat content and offsets from a 1-level jagged awkward array. Returns None if not applicable."""
     try:
         layout = a.layout
-        # unwrap wrappers that don't have offsets (e.g. VirtualArray, IndexedArray)
+        # IndexedArray reorders/filters its content (e.g., after `table[selected]`),
+        # so naively unwrapping it would yield the underlying array's offsets and silently
+        # drop the index. Materialize via ak.to_packed to get a true ListOffsetArray.
+        if isinstance(layout, (ak.contents.IndexedArray, ak.contents.IndexedOptionArray)):
+            layout = ak.to_packed(a).layout
+        # unwrap remaining wrappers that don't have offsets (e.g. VirtualArray)
         while not hasattr(layout, "offsets"):
+            if isinstance(layout, (ak.contents.IndexedArray, ak.contents.IndexedOptionArray)):
+                return None
             if hasattr(layout, "content"):
                 layout = layout.content
             else:
@@ -105,10 +112,24 @@ def _repeat_pad(a, maxlen, dtype="float32"):
     assert isinstance(a, ak.Array)
     if a.ndim == 1:
         a = ak.unflatten(a, 1)
-    content, offsets = _get_content_and_offsets(a)
-    nrows = len(offsets) - 1
-    out = np.empty((nrows, maxlen), dtype=dtype)
-    _repeat_pad_jagged_kernel(content.astype(dtype), offsets, out)
+    result = _get_content_and_offsets(a)
+    if result is not None:
+        content, offsets = result
+        nrows = len(offsets) - 1
+        out = np.zeros((nrows, maxlen), dtype=dtype)
+        _repeat_pad_jagged_kernel(content.astype(dtype), offsets, out)
+        return out
+    # fallback for complex layouts
+    counts = np.asarray(ak.num(a))
+    nrows = len(counts)
+    out = np.zeros((nrows, maxlen), dtype=dtype)
+    idx = np.arange(maxlen)
+    for i in range(nrows):
+        n = int(counts[i])
+        if n == 0:
+            continue
+        row = np.asarray(a[i], dtype=dtype)
+        out[i] = row[idx % n]
     return out
 
 
@@ -252,19 +273,19 @@ def _fused_pad_and_stack(table, var_names, preprocess_params, dtype="float32"):
     pad_mode = preprocess_params[var_names[0]]["pad_mode"]
 
     content_arrays = []
-    param_centers = np.empty(n_vars, dtype=np.float32)
-    param_scales = np.empty(n_vars, dtype=np.float32)
-    param_los = np.empty(n_vars, dtype=np.float32)
-    param_his = np.empty(n_vars, dtype=np.float32)
-    param_do_centers = np.empty(n_vars, dtype=np.bool_)
-    param_pad_values = np.empty(n_vars, dtype=np.float32)
+    param_centers = np.zeros(n_vars, dtype=np.float32)
+    param_scales = np.zeros(n_vars, dtype=np.float32)
+    param_los = np.zeros(n_vars, dtype=np.float32)
+    param_his = np.zeros(n_vars, dtype=np.float32)
+    param_do_centers = np.zeros(n_vars, dtype=np.bool_)
+    param_pad_values = np.zeros(n_vars, dtype=np.float32)
 
     for vi, vn in enumerate(var_names):
         result = _get_content_and_offsets(table[vn])
         if result is None or len(result[1]) != len(shared_offsets):
             return None
         content, offsets = result
-        if offsets[-1] != shared_offsets[-1]:
+        if not np.array_equal(offsets, shared_offsets):
             return None
 
         p = preprocess_params[vn]
@@ -279,14 +300,14 @@ def _fused_pad_and_stack(table, var_names, preprocess_params, dtype="float32"):
         content_arrays.append(content_f32)
 
     content_len = int(shared_offsets[-1])
-    all_content = np.empty(n_vars * content_len, dtype=np.float32)
-    content_starts = np.empty(n_vars, dtype=np.int64)
+    all_content = np.zeros(n_vars * content_len, dtype=np.float32)
+    content_starts = np.zeros(n_vars, dtype=np.int64)
     for vi in range(n_vars):
         start = vi * content_len
         content_starts[vi] = start
         all_content[start:start + content_len] = content_arrays[vi]
 
-    out = np.zeros((nrows, n_vars, padlen), dtype=dtype) if pad_mode != "wrap" else np.empty((nrows, n_vars, padlen), dtype=dtype)
+    out = np.zeros((nrows, n_vars, padlen), dtype=dtype)
 
     if pad_mode == "wrap":
         _batched_fused_repeat_pad(all_content, content_starts, shared_offsets,

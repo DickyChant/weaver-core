@@ -1,0 +1,243 @@
+"""
+MeanFlow loss for generative training inside the weaver framework.
+
+Ported from CaloDiffu_HGCAL/scripts/CaloDiffu.py (sample_t_r, adaptive_l2_loss,
+compute_loss_meanflow_old). Trimmed to the minimum needed for a weaver-style
+get_loss/get_train_fn contract.
+
+Conventions:
+    z(t) = (1 - t) * x_data + t * eps,   eps ~ N(0, I)
+    target velocity: v = eps - x_data
+    model is called as model(z, t, r, *cond) where cond carries per-event
+    conditioning (e.g. energy, jet kinematics). For r == t we get the
+    instantaneous flow-matching mode; for r < t we get the MeanFlow target
+    u_tgt = v - (t - r) * dudt, with dudt obtained via JVP.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from weaver.nn.loss.seal_lorentz import (
+    Lorentz_gens,
+    SO3_gens,
+    block_pad_generators,
+    delta_seal_vector,
+)
+
+
+def stopgrad(x):
+    return x.detach()
+
+
+def adaptive_l2_loss(error, gamma=0.5, c=1e-3):
+    """sg(w) * ||delta||^2 with w = 1 / (||delta||^2 + c)^(1-gamma)."""
+    dims = tuple(range(1, error.ndim))
+    delta_sq = (error ** 2).mean(dim=dims) if dims else (error ** 2).mean(dim=0)
+    p = 1.0 - gamma
+    w = 1.0 / (delta_sq + c).pow(p)
+    return (stopgrad(w) * delta_sq).mean()
+
+
+def sample_t_r(batch_size, device, flow_ratio=0.75, time_dist=("lognorm", -0.4, 1.0)):
+    """Sample (t, r) pairs with t >= r and with probability flow_ratio set r = t."""
+    kind = time_dist[0]
+    if kind == "uniform":
+        samples = np.random.rand(batch_size, 2).astype(np.float32)
+    elif kind == "lognorm":
+        mu, sigma = time_dist[1], time_dist[2]
+        z = np.random.randn(batch_size, 2).astype(np.float32) * sigma + mu
+        samples = 1.0 / (1.0 + np.exp(-z))
+    else:
+        raise ValueError(f"Unknown time_dist kind {kind!r}")
+    t_np = np.maximum(samples[:, 0], samples[:, 1])
+    r_np = np.minimum(samples[:, 0], samples[:, 1])
+    if flow_ratio > 0:
+        idx = np.random.permutation(batch_size)[: int(flow_ratio * batch_size)]
+        r_np[idx] = t_np[idx]
+    return (
+        torch.as_tensor(t_np, device=device),
+        torch.as_tensor(r_np, device=device),
+    )
+
+
+def _expand_like(t, like):
+    return t.view(t.size(0), *([1] * (like.ndim - 1)))
+
+
+class MeanFlowLoss(nn.Module):
+    """Callable wrapper holding hyperparameters for the MeanFlow training loss.
+
+    The model passed at forward time must accept (z, t, r, *cond) and return
+    the predicted velocity u(z, t, r | cond).
+    """
+
+    def __init__(
+        self,
+        flow_ratio: float = 0.75,
+        time_dist=("lognorm", -0.4, 1.0),
+        jvp_api: str = "func",
+        adaptive_gamma: float = 0.5,
+        adaptive_c: float = 1e-3,
+    ):
+        super().__init__()
+        assert jvp_api in ("func", "autograd"), jvp_api
+        self.flow_ratio = float(flow_ratio)
+        self.time_dist = tuple(time_dist)
+        self.jvp_api = jvp_api
+        self.adaptive_gamma = float(adaptive_gamma)
+        self.adaptive_c = float(adaptive_c)
+
+    def forward(self, model, data, *cond):
+        device = data.device
+        bsz = data.shape[0]
+        eps = torch.randn_like(data)
+        t, r = sample_t_r(bsz, device, self.flow_ratio, self.time_dist)
+        t_ = _expand_like(t, data)
+        r_ = _expand_like(r, data)
+        z = (1.0 - t_) * data + t_ * eps
+        v = eps - data
+
+        def fn(z_, t_in, r_in):
+            return model(z_, t_in.flatten(), r_in.flatten(), *cond)
+
+        if self.jvp_api == "func":
+            u, dudt = torch.func.jvp(
+                fn, (z, t_, r_), (v, torch.ones_like(t_), torch.zeros_like(r_))
+            )
+        else:
+            u, dudt = torch.autograd.functional.jvp(
+                fn, (z, t_, r_), (v, torch.ones_like(t_), torch.zeros_like(r_)),
+                create_graph=True,
+            )
+
+        u_tgt = v - (t_ - r_) * dudt
+        loss = adaptive_l2_loss(u - stopgrad(u_tgt), gamma=self.adaptive_gamma, c=self.adaptive_c)
+        info = {
+            "mse": (stopgrad(u - u_tgt) ** 2).mean().item(),
+            "t_mean": t.mean().item(),
+            "r_mean": r.mean().item(),
+        }
+        return loss, info
+
+
+class MeanFlowSEALLoss(nn.Module):
+    """MeanFlow + deltaSEAL on the 1-NFE generation.
+
+    Two terms:
+    1. Standard MeanFlow loss on the full feature vector (as in `MeanFlowLoss`).
+    2. Vector-output deltaSEAL on the 1-NFE generation
+           f(z, cond) = z - u(z, t=1, r=0, cond)
+       with block-diagonal Lorentz/SO(3) generators on the kinematic columns
+       (cols `kin_start..kin_start+kin_dim`) and zero generators on the rest
+       of the feature vector. Per the design discussion: kinematics carry the
+       symmetry constraint; detector features are declared invariant and the
+       data likelihood (the MeanFlow term) is responsible for getting their
+       correlations with the kinematics right.
+
+    The SEAL term is non-trivial *because* it goes through the model u: the
+    constraint  df/dz . (L z) = L . f(z)  is an equivariance statement on the
+    learned generator, not a statement about the analytic structure of
+    invariants. Computed via `torch.func.jvp` so each generator costs one
+    extra forward; with `group='so3'` only 3 JVPs, with `group='lorentz'` 6.
+
+    For cost control, set `num_gens_per_step` < total to randomly sample a
+    subset of generators each training step.
+    """
+
+    def __init__(
+        self,
+        flow_ratio: float = 0.75,
+        time_dist=("lognorm", -0.4, 1.0),
+        jvp_api: str = "func",
+        seal_lambda: float = 1.0,
+        kin_start: int = 0,
+        kin_dim: int = 4,
+        group: str = "lorentz",
+        num_gens_per_step: int = -1,
+        normalize_per_generator: bool = True,
+    ):
+        super().__init__()
+        assert group in ("lorentz", "so3"), group
+        assert kin_dim in (3, 4), kin_dim
+        if group == "lorentz" and kin_dim != 4:
+            raise ValueError("Lorentz generators are 4x4; set kin_dim=4 or use group='so3'")
+        if group == "so3" and kin_dim not in (3, 4):
+            raise ValueError("SO(3) wants kin_dim=3 (px,py,pz) or kin_dim=4 (E,px,py,pz, rotates spatial part)")
+        self.meanflow = MeanFlowLoss(flow_ratio=flow_ratio, time_dist=time_dist, jvp_api=jvp_api)
+        self.seal_lambda = float(seal_lambda)
+        self.kin_start = int(kin_start)
+        self.kin_dim = int(kin_dim)
+        self.group = group
+        self.num_gens_per_step = int(num_gens_per_step)
+        self.normalize_per_generator = bool(normalize_per_generator)
+        self._cached_gens = None  # built lazily once we know the feature dim
+
+    def _build_generators(self, feature_dim: int, device, dtype):
+        if self.group == "lorentz":
+            small = Lorentz_gens(dtype=dtype).to(device)  # (6, 4, 4)
+            block_start = self.kin_start
+        else:  # so3
+            small = SO3_gens(dtype=dtype).to(device)  # (3, 3, 3)
+            # If kin_dim == 4 (E + 3-momentum), rotate only the spatial part
+            # (offset by 1). If kin_dim == 3, rotate the whole block.
+            block_start = self.kin_start + (1 if self.kin_dim == 4 else 0)
+        return block_pad_generators(small, feature_dim, block_start)
+
+    def forward(self, model, data, *cond):
+        # term 1: MeanFlow on full features (cond is the same)
+        mf_loss, info = self.meanflow(model, data, *cond)
+        info = dict(info)
+        info["mf"] = float(mf_loss.detach())
+
+        # term 2: deltaSEAL on the 1-NFE generation w.r.t. fresh Gaussian noise
+        device = data.device
+        B, F, N = data.shape[0], data.shape[1], data.shape[2] if data.ndim == 3 else None
+        if self._cached_gens is None or self._cached_gens.shape[-1] != F or self._cached_gens.device != device:
+            self._cached_gens = self._build_generators(F, device, data.dtype)
+        gens = self._cached_gens  # (G, F, F)
+
+        # subsample generators if requested (random subset each call)
+        G = gens.shape[0]
+        if 0 < self.num_gens_per_step < G:
+            idx = torch.randperm(G, device=device)[: self.num_gens_per_step]
+            gens_use = gens[idx]
+        else:
+            gens_use = gens
+
+        # 1-NFE generation function: f(z) = z - u(z, t=1, r=0, cond)
+        ones = torch.ones(data.shape[0], device=device, dtype=data.dtype)
+        zeros = torch.zeros(data.shape[0], device=device, dtype=data.dtype)
+
+        def gen_fn(z_):
+            v = model(z_, ones, zeros, *cond)
+            return z_ - v
+
+        z = torch.randn_like(data)
+        seal_loss = delta_seal_vector(
+            gen_fn, z, gens_use, gens_out=gens_use,
+            take_mean=True, normalize=self.normalize_per_generator,
+        )
+
+        total = mf_loss + self.seal_lambda * seal_loss
+        info["seal"] = float(seal_loss.detach())
+        info["seal_n_gens"] = int(gens_use.shape[0])
+        info["loss_total"] = float(total.detach())
+        return total, info
+
+
+@torch.no_grad()
+def euler_sample(model, shape, device, sample_steps=10, cond=()):
+    """Minimal Euler-style sampling loop: z_{t-dt} = z_t - (t - r) * model(z_t, t, r, cond).
+
+    Time grid runs from 1 -> 0 over (sample_steps + 1) points. Returns the
+    final sample z_0.
+    """
+    z = torch.randn(shape, device=device)
+    t_vals = torch.linspace(1.0, 0.0, sample_steps + 1, device=device)
+    for i in range(sample_steps):
+        t = torch.full((shape[0],), t_vals[i].item(), device=device)
+        r = torch.full((shape[0],), t_vals[i + 1].item(), device=device)
+        v = model(z, t, r, *cond)
+        z = z - _expand_like(t - r, z) * v
+    return z

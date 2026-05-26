@@ -14,6 +14,8 @@ Conventions:
     u_tgt = v - (t - r) * dudt, with dudt obtained via JVP.
 """
 
+import contextlib
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,6 +26,21 @@ from weaver.nn.loss.seal_lorentz import (
     block_pad_generators,
     delta_seal_vector,
 )
+
+
+def _sdpa_jvp_safe_ctx():
+    """Force scaled_dot_product_attention onto the math backend.
+
+    Flash-attention and memory-efficient SDPA don't implement forward-mode AD
+    (torch.func.jvp), which is what MeanFlow + SEAL both depend on. The math
+    backend is slower but JVP-compatible; we enter it only around the JVP
+    region so non-generative paths are unaffected.
+    """
+    try:
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+        return sdpa_kernel([SDPBackend.MATH])
+    except Exception:
+        return contextlib.nullcontext()
 
 
 def stopgrad(x):
@@ -101,15 +118,16 @@ class MeanFlowLoss(nn.Module):
         def fn(z_, t_in, r_in):
             return model(z_, t_in.flatten(), r_in.flatten(), *cond)
 
-        if self.jvp_api == "func":
-            u, dudt = torch.func.jvp(
-                fn, (z, t_, r_), (v, torch.ones_like(t_), torch.zeros_like(r_))
-            )
-        else:
-            u, dudt = torch.autograd.functional.jvp(
-                fn, (z, t_, r_), (v, torch.ones_like(t_), torch.zeros_like(r_)),
-                create_graph=True,
-            )
+        with _sdpa_jvp_safe_ctx():
+            if self.jvp_api == "func":
+                u, dudt = torch.func.jvp(
+                    fn, (z, t_, r_), (v, torch.ones_like(t_), torch.zeros_like(r_))
+                )
+            else:
+                u, dudt = torch.autograd.functional.jvp(
+                    fn, (z, t_, r_), (v, torch.ones_like(t_), torch.zeros_like(r_)),
+                    create_graph=True,
+                )
 
         u_tgt = v - (t_ - r_) * dudt
         loss = adaptive_l2_loss(u - stopgrad(u_tgt), gamma=self.adaptive_gamma, c=self.adaptive_c)
@@ -156,6 +174,19 @@ class MeanFlowSEALLoss(nn.Module):
         group: str = "lorentz",
         num_gens_per_step: int = -1,
         normalize_per_generator: bool = True,
+        # --- Augmented-Lagrangian / MDMM auto-balancing ---
+        # When `adaptive_lambda=True` we treat SEAL as a soft constraint
+        # `SEAL <= target_violation` and run dual ascent on `seal_lambda`:
+        #   lambda <- clip( lambda + lambda_lr * (EMA(SEAL) - target), [0, lambda_max] )
+        # The fixed `seal_lambda` arg above is used as the initial value.
+        # Set `target_violation` to a small positive number (the level of
+        # equivariance violation you'll tolerate at convergence). The EMA
+        # smooths the SEAL value to avoid lambda oscillation.
+        adaptive_lambda: bool = False,
+        target_violation: float = 1e-3,
+        lambda_lr: float = 1e-2,
+        lambda_max: float = 100.0,
+        seal_ema_alpha: float = 0.95,
     ):
         super().__init__()
         assert group in ("lorentz", "so3"), group
@@ -165,13 +196,25 @@ class MeanFlowSEALLoss(nn.Module):
         if group == "so3" and kin_dim not in (3, 4):
             raise ValueError("SO(3) wants kin_dim=3 (px,py,pz) or kin_dim=4 (E,px,py,pz, rotates spatial part)")
         self.meanflow = MeanFlowLoss(flow_ratio=flow_ratio, time_dist=time_dist, jvp_api=jvp_api)
-        self.seal_lambda = float(seal_lambda)
         self.kin_start = int(kin_start)
         self.kin_dim = int(kin_dim)
         self.group = group
         self.num_gens_per_step = int(num_gens_per_step)
         self.normalize_per_generator = bool(normalize_per_generator)
         self._cached_gens = None  # built lazily once we know the feature dim
+
+        # SEAL weight: buffer so it persists in checkpoints + DDP sync.
+        # We update it in-place during forward() without grad if adaptive.
+        self.register_buffer("seal_lambda", torch.tensor(float(seal_lambda)))
+        self.adaptive_lambda = bool(adaptive_lambda)
+        self.target_violation = float(target_violation)
+        self.lambda_lr = float(lambda_lr)
+        self.lambda_max = float(lambda_max)
+        self.seal_ema_alpha = float(seal_ema_alpha)
+        # EMA of SEAL violation; initialised to 0 (will warm up over first ~10 steps)
+        self.register_buffer("seal_ema", torch.tensor(0.0))
+        # Counter to detect first step (skip EMA bias correction beyond a few steps)
+        self.register_buffer("_step_count", torch.tensor(0, dtype=torch.long))
 
     def _build_generators(self, feature_dim: int, device, dtype):
         if self.group == "lorentz":
@@ -214,14 +257,41 @@ class MeanFlowSEALLoss(nn.Module):
             return z_ - v
 
         z = torch.randn_like(data)
-        seal_loss = delta_seal_vector(
-            gen_fn, z, gens_use, gens_out=gens_use,
-            take_mean=True, normalize=self.normalize_per_generator,
-        )
+        with _sdpa_jvp_safe_ctx():
+            seal_loss = delta_seal_vector(
+                gen_fn, z, gens_use, gens_out=gens_use,
+                take_mean=True, normalize=self.normalize_per_generator,
+            )
 
-        total = mf_loss + self.seal_lambda * seal_loss
+        # Pull the current lambda as a plain Python float so it doesn't
+        # accumulate into the autograd graph; we apply gradients to model
+        # parameters only, the multiplier is updated by dual ascent below.
+        cur_lambda = float(self.seal_lambda.detach().item())
+        total = mf_loss + cur_lambda * seal_loss
+
+        if self.adaptive_lambda:
+            with torch.no_grad():
+                seal_val = seal_loss.detach()
+                # EMA of the SEAL violation
+                self._step_count.add_(1)
+                if int(self._step_count.item()) == 1:
+                    # initialise EMA to first value to avoid a long warmup
+                    self.seal_ema.copy_(seal_val)
+                else:
+                    self.seal_ema.mul_(self.seal_ema_alpha).add_(
+                        (1.0 - self.seal_ema_alpha) * seal_val
+                    )
+                # Dual ascent on the multiplier: grow when constraint
+                # violated (EMA > target), shrink when satisfied. Project to
+                # [0, lambda_max].
+                update = self.lambda_lr * (self.seal_ema - self.target_violation)
+                new_lambda = (self.seal_lambda + update).clamp_(0.0, self.lambda_max)
+                self.seal_lambda.copy_(new_lambda)
+                info["seal_ema"] = float(self.seal_ema.item())
+
         info["seal"] = float(seal_loss.detach())
         info["seal_n_gens"] = int(gens_use.shape[0])
+        info["seal_lambda"] = cur_lambda
         info["loss_total"] = float(total.detach())
         return total, info
 

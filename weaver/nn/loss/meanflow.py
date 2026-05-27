@@ -105,7 +105,10 @@ class MeanFlowLoss(nn.Module):
         self.adaptive_gamma = float(adaptive_gamma)
         self.adaptive_c = float(adaptive_c)
 
-    def forward(self, model, data, *cond):
+    def forward(self, model, data, *cond, mask=None):
+        # mask is unused by the velocity loss itself but accepted so the
+        # generative trainer can call all loss variants with the same kwargs.
+        del mask  # explicit "intentionally unused"
         device = data.device
         bsz = data.shape[0]
         eps = torch.randn_like(data)
@@ -187,6 +190,14 @@ class MeanFlowSEALLoss(nn.Module):
         lambda_lr: float = 1e-2,
         lambda_max: float = 100.0,
         seal_ema_alpha: float = 0.95,
+        # --- PIDM-style residual on the 1-NFE generation -----------------
+        # `residual_func(x_hat, mask, cond) -> (scalar, info_dict)` is called
+        # on the same 1-NFE estimate f(z) used by SEAL. Use it to inject
+        # physics-derived constraints on aggregated observables (jet E/pT/mass
+        # sum rules, charge neutrality, ...). See weaver.nn.loss.residuals_jet
+        # for the JetResiduals helper that matches the JetClass yaml layout.
+        residual_func=None,
+        lam_residual: float = 0.0,
     ):
         super().__init__()
         assert group in ("lorentz", "so3"), group
@@ -216,6 +227,12 @@ class MeanFlowSEALLoss(nn.Module):
         # Counter to detect first step (skip EMA bias correction beyond a few steps)
         self.register_buffer("_step_count", torch.tensor(0, dtype=torch.long))
 
+        # PIDM-style residual hook. Kept as an attribute (not a buffer / module
+        # registration via add_module) because callers may pass a plain
+        # callable; if it is an nn.Module it gets registered via setattr.
+        self.residual_func = residual_func
+        self.lam_residual = float(lam_residual)
+
     def _build_generators(self, feature_dim: int, device, dtype):
         if self.group == "lorentz":
             small = Lorentz_gens(dtype=dtype).to(device)  # (6, 4, 4)
@@ -227,7 +244,7 @@ class MeanFlowSEALLoss(nn.Module):
             block_start = self.kin_start + (1 if self.kin_dim == 4 else 0)
         return block_pad_generators(small, feature_dim, block_start)
 
-    def forward(self, model, data, *cond):
+    def forward(self, model, data, *cond, mask=None):
         # term 1: MeanFlow on full features (cond is the same)
         mf_loss, info = self.meanflow(model, data, *cond)
         info = dict(info)
@@ -292,6 +309,24 @@ class MeanFlowSEALLoss(nn.Module):
         info["seal"] = float(seal_loss.detach())
         info["seal_n_gens"] = int(gens_use.shape[0])
         info["seal_lambda"] = cur_lambda
+
+        # --- PIDM-style residual on the 1-NFE generation -----------------
+        # Compute x_hat = gen_fn(z') with a FRESH noise z' (independent of the
+        # one used by SEAL, so the residual sees an unbiased sample) and feed
+        # to the residual_func. The model is differentiated through, so the
+        # residual gradient flows back into the velocity head. One extra
+        # forward per step when enabled.
+        if self.residual_func is not None and self.lam_residual > 0:
+            z_res = torch.randn_like(data)
+            with _sdpa_jvp_safe_ctx():
+                x_hat = gen_fn(z_res)
+            res_loss, res_info = self.residual_func(x_hat, mask, cond)
+            total = total + self.lam_residual * res_loss
+            info["residual"] = float(res_loss.detach())
+            info["lam_residual"] = float(self.lam_residual)
+            for k, v in res_info.items():
+                info[f"res_{k}"] = v
+
         info["loss_total"] = float(total.detach())
         return total, info
 

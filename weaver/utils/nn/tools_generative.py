@@ -3,7 +3,7 @@ Generative training/eval loops for weaver.
 
 These mirror `train_classification` / `evaluate_classification` from
 `weaver/utils/nn/tools.py` but accept a loss callable with signature
-    loss_func(model, data, *cond) -> (loss, info_dict)
+    loss_func(model, data, *cond, mask=mask) -> (loss, info_dict)
 so the loss owns the noise sampling / JVP / target construction (e.g. a
 MeanFlow loss), and the wrapping model `forward(z, t, r, *cond)` returns the
 predicted velocity.
@@ -25,21 +25,26 @@ from weaver.utils.nn.tools import (
 from weaver.utils.logger import _logger
 
 
-def _select_inputs(X, data_config, input_key=None, cond_keys=None):
-    """Split a weaver batch into (data, cond) tensors.
+def _select_inputs(X, data_config, input_key=None, cond_keys=None, mask_key=None):
+    """Split a weaver batch into (data, cond, mask) tensors.
 
-    By default `data` is the first input group and `cond` is the rest.
-    Override via `input_key` and `cond_keys` (list[str]) when constructing
-    a custom train function from a network-config.
+    By default `data` is the first input group and `cond` is whatever the
+    network-config declared. `mask_key` is auto-detected as the first input
+    group whose name ends in `_mask` (or you can pass it explicitly).
+    Override `input_key` / `cond_keys` (list[str]) when constructing a custom
+    train function from a network-config.
     """
     if input_key is None:
         input_key = data_config.input_names[0]
         cond_keys = list(data_config.input_names[1:])
     elif cond_keys is None:
         cond_keys = [k for k in data_config.input_names if k != input_key]
+    if mask_key is None:
+        mask_key = next((k for k in data_config.input_names if k.endswith("_mask")), None)
     data = X[input_key]
     cond = [X[k] for k in cond_keys]
-    return data, cond
+    mask = X[mask_key] if mask_key is not None and mask_key in X else None
+    return data, cond, mask
 
 
 def make_train_generative(input_key=None, cond_keys=None):
@@ -74,15 +79,16 @@ def make_train_generative(input_key=None, cond_keys=None):
 
         with tqdm.tqdm(train_loader) as tq:
             for X, _y, _Z in tq:
-                data, cond = _select_inputs(X, data_config, input_key, cond_keys)
+                data, cond, mask = _select_inputs(X, data_config, input_key, cond_keys)
                 data = data.to(dev)
                 cond = [c.to(dev) for c in cond]
+                mask = mask.to(dev) if mask is not None else None
                 entry_count += data.shape[0]
                 if tb_helper:
                     tb_helper.global_step += 1
                 opt.zero_grad()
                 with torch.autocast("cuda", enabled=enable_autocast, dtype=autocast_dtype):
-                    loss, info = loss_func(model, data, *cond)
+                    loss, info = loss_func(model, data, *cond, mask=mask)
                 if grad_scaler is None:
                     loss.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -166,12 +172,13 @@ def make_evaluate_generative(input_key=None, cond_keys=None):
         # torch.func.jvp we can skip torch.no_grad and use inference_mode.
         with tqdm.tqdm(test_loader) as tq:
             for X, _y, _Z in tq:
-                data, cond = _select_inputs(X, data_config, input_key, cond_keys)
+                data, cond, mask = _select_inputs(X, data_config, input_key, cond_keys)
                 data = data.to(dev)
                 cond = [c.to(dev) for c in cond]
+                mask = mask.to(dev) if mask is not None else None
                 num = data.shape[0]
                 with torch.autocast("cuda", enabled=enable_autocast, dtype=autocast_dtype):
-                    loss, info = loss_func(model, data, *cond)
+                    loss, info = loss_func(model, data, *cond, mask=mask)
                 lv = loss.item()
                 num_batches += 1
                 count += num

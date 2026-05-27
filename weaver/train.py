@@ -26,6 +26,11 @@ parser.add_argument('--run-mode', type=functools.partial(str.split, sep=','), de
                     help='comma-separated list of the steps (train|val|test) to run, e.g., `train,test`')
 parser.add_argument('--regression-mode', action=argparse.BooleanOptionalAction, default=False,
                     help='run in regression mode if this flag is set; otherwise run in classification mode')
+parser.add_argument('--best-metric-by', type=str, default='auto', choices=['auto', 'min', 'max'],
+                    help='direction for picking the "best" validation metric. '
+                         '`auto` (default) preserves existing behaviour: `min` if --regression-mode else `max`. '
+                         'Use `min` for generative / loss-as-metric runs where lower is better; '
+                         '`max` to force classifier-style higher-is-better even outside --regression-mode.')
 parser.add_argument('-c', '--data-config', type=str,
                     help='data config YAML file')
 parser.add_argument('--data-config-val', type=str, default=None,
@@ -54,6 +59,8 @@ parser.add_argument('-t', '--data-test', nargs='*', default=[],
                          ' (c) split output per N input files, `--data-test a%%10:/path/to/a/*`, will split per 10 input files')
 parser.add_argument('--data-fraction', type=float, default=1,
                     help='fraction of events to load from each file; for training, the events are randomly selected for each epoch')
+parser.add_argument('--data-fraction-val', type=float, default=None,
+                    help='--data-fraction for the validation data loader; defaults to --data-fraction if not set')
 parser.add_argument('--file-fraction', type=float, default=1,
                     help='fraction of files to load; for training, the files are randomly selected for each epoch')
 parser.add_argument('--fetch-by-files', action=argparse.BooleanOptionalAction, default=False,
@@ -315,7 +322,7 @@ def train_load(args):
         batch_size=args.batch_size_val,
         for_training=True,
         extra_selection=args.extra_selection_val,
-        load_range_and_fraction=(val_range, args.data_fraction, args.data_split_val),
+        load_range_and_fraction=(val_range, args.data_fraction_val if args.data_fraction_val is not None else args.data_fraction, args.data_split_val),
         file_fraction=args.file_fraction,
         fetch_by_files=args.fetch_by_files,
         fetch_step=args.fetch_step_val,
@@ -1094,7 +1101,15 @@ def _main(args):
             return
 
         # training loop
-        best_valid_metric = np.inf if args.regression_mode else 0
+        # Resolve which direction counts as "better" for the validation metric.
+        # `auto` keeps the historical rule (regression -> min, else max). Explicit
+        # min / max overrides it -- e.g. for generative training where the
+        # network-config wires in a loss-as-metric and we always want the lowest.
+        _best_by = args.best_metric_by
+        if _best_by == 'auto':
+            _best_by = 'min' if args.regression_mode else 'max'
+        _best_is_better = (lambda cur, best: cur < best) if _best_by == 'min' else (lambda cur, best: cur > best)
+        best_valid_metric = np.inf if _best_by == 'min' else -np.inf
         grad_scaler = torch.GradScaler("cuda") if args.use_amp and args.amp_dtype == "fp16" else None
         for epoch in range(args.num_epochs):
             if args.load_epoch is not None:
@@ -1152,9 +1167,7 @@ def _main(args):
                     tb_helper=tb,
                     extra_args=locals(),
                 )
-                is_best_epoch = (
-                    (valid_metric < best_valid_metric) if args.regression_mode else (valid_metric > best_valid_metric)
-                )
+                is_best_epoch = _best_is_better(valid_metric, best_valid_metric)
                 if is_best_epoch:
                     best_valid_metric = valid_metric
                     if args.model_prefix and (args.backend is None or local_rank == 0):

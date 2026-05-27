@@ -5,7 +5,7 @@ import numpy as np
 import awkward as ak
 
 from ..logger import _logger, warn_n_times
-from .eval_utils import _get_variable_names, _eval_expr
+from .eval_utils import _get_data_var_names, _eval_expr
 from .fileio import _read_files
 from .config import _strcat
 
@@ -14,7 +14,7 @@ def _apply_selection(table, selection, funcs=None):
     if selection is None:
         return table
     if funcs:
-        new_vars = {k: funcs[k] for k in _get_variable_names(selection) if k not in table.fields and k in funcs}
+        new_vars = {k: funcs[k] for k in _get_data_var_names(selection) if k not in table.fields and k in funcs}
         _build_new_variables(table, new_vars)
     selected = ak.values_astype(_eval_expr(selection, table), "bool")
     return table[selected]
@@ -99,14 +99,14 @@ class AutoStandardizer(object):
                 keep_branches.add(k)
                 load_branches.add(k)
         if self._data_config.selection:
-            load_branches.update(_get_variable_names(self._data_config.selection))
+            load_branches.update(_get_data_var_names(self._data_config.selection))
 
         func_vars = set(self._data_config.var_funcs.keys())
         while load_branches & func_vars:
             for k in load_branches & func_vars:
                 aux_branches.add(k)
                 load_branches.remove(k)
-                load_branches.update(_get_variable_names(self._data_config.var_funcs[k]))
+                load_branches.update(_get_data_var_names(self._data_config.var_funcs[k]))
 
         _logger.debug("[AutoStandardizer] keep_branches:\n  %s", ",".join(keep_branches))
         _logger.debug("[AutoStandardizer] aux_branches:\n  %s", ",".join(aux_branches))
@@ -185,14 +185,14 @@ class WeightMaker(object):
         aux_branches = set()
         load_branches = keep_branches.copy()
         if self._data_config.selection:
-            load_branches.update(_get_variable_names(self._data_config.selection))
+            load_branches.update(_get_data_var_names(self._data_config.selection))
 
         func_vars = set(self._data_config.var_funcs.keys())
         while load_branches & func_vars:
             for k in load_branches & func_vars:
                 aux_branches.add(k)
                 load_branches.remove(k)
-                load_branches.update(_get_variable_names(self._data_config.var_funcs[k]))
+                load_branches.update(_get_data_var_names(self._data_config.var_funcs[k]))
 
         _logger.debug("[WeightMaker] keep_branches:\n  %s", ",".join(keep_branches))
         _logger.debug("[WeightMaker] aux_branches:\n  %s", ",".join(aux_branches))

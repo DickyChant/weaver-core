@@ -3,7 +3,7 @@ import yaml
 import copy
 
 from ..logger import _logger
-from .eval_utils import _get_variable_names
+from .eval_utils import _get_data_var_names
 
 
 def _as_list(x):
@@ -207,10 +207,10 @@ class DataConfig(object):
 
         # selection
         if self.selection:
-            self.register(_get_variable_names(self.selection), to="train")
+            self.register(_get_data_var_names(self.selection), to="train")
         # test time selection
         if self.test_time_selection:
-            self.register(_get_variable_names(self.test_time_selection), to="test")
+            self.register(_get_data_var_names(self.test_time_selection), to="test")
         # inputs
         for names in self.input_dicts.values():
             self.register(names)
@@ -228,7 +228,7 @@ class DataConfig(object):
                 for k in load_branches & func_vars:
                     aux_branches.add(k)
                     load_branches.remove(k)
-                    load_branches.update(_get_variable_names(self.var_funcs[k]))
+                    load_branches.update(_get_data_var_names(self.var_funcs[k]))
         if print_info:
             _logger.debug("train_load_branches:\n  %s", ", ".join(sorted(self.train_load_branches)))
             _logger.debug("train_aux_branches:\n  %s", ", ".join(sorted(self.train_aux_branches)))
@@ -240,7 +240,10 @@ class DataConfig(object):
         self.test_var_funcs = {k: v for k, v in self.var_funcs.items() if k in self.test_aux_branches}
 
     def __getattr__(self, name):
-        return self.options[name]
+        try:
+            return self.options[name]
+        except KeyError:
+            raise AttributeError(name)
 
     def register(self, name, expr=None, to="both"):
         assert to in ("train", "test", "both")

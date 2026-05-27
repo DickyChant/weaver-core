@@ -9,7 +9,7 @@ import torch.utils.data
 from functools import partial
 from concurrent.futures.thread import ThreadPoolExecutor
 from .logger import _logger
-from .data.tools import _pad, _repeat_pad, _clip, _stack
+from .data.tools import _pad, _repeat_pad, _clip, _stack, _fused_pad_and_stack, _get_content_and_offsets
 from .data.fileio import _read_files
 from .data.config import DataConfig, _md5
 from .data.preprocess import _apply_selection, _build_new_variables, _build_weights, AutoStandardizer, WeightMaker
@@ -27,20 +27,44 @@ def _finalize_inputs(table, data_config):
     # copy observer variables before transformation
     for k in data_config.z_variables:
         if k in data_config.observer_names:
-            output[k] = table[k]  # ak.Array
+            arr = table[k]
+            output[k] = ak.to_numpy(arr) if isinstance(arr, ak.Array) and arr.ndim == 1 else arr
     # copy labels
     for k in data_config.label_names:
         output[k] = ak.to_numpy(table[k])
-    # transformation
+
+    # validate auto-standardization upfront
+    if data_config._auto_standardization:
+        for k, params in data_config.preprocess_params.items():
+            if params["center"] == "auto":
+                raise ValueError("No valid standardization params for %s" % k)
+
+    # try fused path for each input group (standardize + pad + nan_to_num + stack in one kernel)
+    fused_vars = set()
+    for group_name, var_names in data_config.input_dicts.items():
+        if data_config.preprocess_params[var_names[0]]["length"] is None:
+            continue
+        result = _fused_pad_and_stack(table, var_names, data_config.preprocess_params)
+        if result is not None:
+            output["_" + group_name] = result
+            fused_vars.update(var_names)
+            # NaN warnings on raw content (cheap scan)
+            for vn in var_names:
+                if vn not in _nan_warned_vars:
+                    co = _get_content_and_offsets(table[vn])
+                    if co is not None and np.any(np.isnan(co[0])):
+                        _logger.warning("Variable '%s' contains NaN values (this warning is shown only once)", vn)
+                        _nan_warned_vars.add(vn)
+
+    # fallback: per-variable transformation for vars not handled by fused path
     for k, params in data_config.preprocess_params.items():
-        if data_config._auto_standardization and params["center"] == "auto":
-            raise ValueError("No valid standardization params for %s" % k)
+        if k in fused_vars:
+            continue
         if params["center"] is not None:
             table[k] = _clip((table[k] - params["center"]) * params["scale"], params["min"], params["max"])
         if params["length"] is not None:
             pad_fn = _repeat_pad if params["pad_mode"] == "wrap" else partial(_pad, value=params["pad_value"])
             table[k] = pad_fn(table[k], params["length"])
-        # log variables that contain NaN (once per variable)
         if k not in _nan_warned_vars:
             _has_nan = np.any(np.isnan(table[k]))
             if _has_nan:
@@ -48,13 +72,15 @@ def _finalize_inputs(table, data_config):
                 _nan_warned_vars.add(k)
         table[k] = np.nan_to_num(table[k])
 
-    # stack variables for each input group
+    # stack remaining input groups not handled by fused path
     def _to_f32(x):
         if isinstance(x, np.ndarray):
             return x if x.dtype == np.float32 else x.astype("float32")
         return np.asarray(ak.to_numpy(ak.values_astype(x, "float32")), dtype="float32")
 
     for k, names in data_config.input_dicts.items():
+        if "_" + k in output:
+            continue
         if len(names) == 1 and data_config.preprocess_params[names[0]]["length"] is None:
             output["_" + k] = _to_f32(table[names[0]])
         else:
@@ -67,7 +93,8 @@ def _finalize_inputs(table, data_config):
     # copy monitor variables (after transformation)
     for k in data_config.z_variables:
         if k in data_config.monitor_variables:
-            output[k] = table[k]  # ak.Array
+            arr = table[k]
+            output[k] = ak.to_numpy(arr) if isinstance(arr, ak.Array) and arr.ndim == 1 else arr
     return output
 
 
@@ -236,8 +263,11 @@ class _SimpleIter(object):
             if self.split_num > 1:
                 _logger.warning("`split_num` is fixed to 1 when fetching by files.")
             self.load_filelist_and_ranges = [
-                (self.filelist[i : i + self._fetch_step], [self.load_range] * self._fetch_step)
-                for i in range(0, len(self.filelist), self._fetch_step)
+                (files, [self.load_range] * len(files))
+                for files in (
+                    self.filelist[i : i + self._fetch_step]
+                    for i in range(0, len(self.filelist), self._fetch_step)
+                )
             ]
         else:
             self.load_filelist_and_ranges = []
@@ -287,7 +317,7 @@ class _SimpleIter(object):
             self._file_fraction,
             int(len(sum(self._init_file_dict.values(), [])) * self._file_fraction),
             str(self.load_range),
-            "\n".join(self.filelist[:3]) + "\n ... " + self.filelist[-1],
+            "\n".join(self.filelist[:3]) + ("\n ... " + self.filelist[-1] if self.filelist else ""),
         )
 
         debug_text = "Load filelist and ranges in each iteration:\n"
@@ -351,7 +381,7 @@ class _SimpleIter(object):
         if end_of_list:
             if init:
                 raise RuntimeError(
-                    "Nothing to load for worker %d" % 0 if self.worker_info is None else self.worker_info.id
+                    "Nothing to load for worker %d" % (0 if self.worker_info is None else self.worker_info.id)
                 )
             if self._infinity_mode and not self._in_memory:
                 # infinity mode: re-start

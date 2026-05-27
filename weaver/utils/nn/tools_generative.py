@@ -62,6 +62,15 @@ def make_train_generative(input_key=None, cond_keys=None):
         grad_norm_max = 0.0
         start = time.time()
         entry_count = 0
+        # running mean of every key the loss reports in its `info` dict (mf,
+        # seal, seal_lambda, mse, ...). Lets us print per-component averages
+        # in the epoch summary instead of needing a tensorboard reader.
+        info_sums = {}
+
+        # Keys we want surfaced in the tqdm postfix (these are the typical
+        # MeanFlow / MeanFlowSEAL outputs). Anything else still ends up in TB
+        # and the per-epoch summary.
+        _postfix_keys = ("mf", "seal", "seal_lambda")
 
         with tqdm.tqdm(train_loader) as tq:
             for X, _y, _Z in tq:
@@ -94,12 +103,18 @@ def make_train_generative(input_key=None, cond_keys=None):
                 total_loss += loss_val
                 num_batches += 1
                 grad_norm_max = max(grad_norm_max, grad_norm)
-                tq.set_postfix({
+                for k, v in info.items():
+                    info_sums[k] = info_sums.get(k, 0.0) + float(v)
+
+                postfix = {
                     "lr": "%.2e" % scheduler.get_last_lr()[0] if scheduler else opt.defaults["lr"],
-                    "Loss": "%.5f" % loss_val,
-                    "AvgLoss": "%.5f" % (total_loss / num_batches),
-                    "MSE": "%.5f" % info.get("mse", float("nan")),
-                })
+                    "Loss": "%.4f" % loss_val,
+                    "Avg": "%.4f" % (total_loss / num_batches),
+                }
+                for k in _postfix_keys:
+                    if k in info:
+                        postfix[k] = "%.2e" % float(info[k])
+                tq.set_postfix(postfix)
 
                 if tb_helper:
                     rows = [
@@ -119,7 +134,11 @@ def make_train_generative(input_key=None, cond_keys=None):
         dt = time.time() - start
         _logger.info("Processed %d entries (avg %.1f e/s)", entry_count, entry_count / max(dt, 1e-6))
         _logger.info("Train AvgLoss: %.5f (max grad-norm %.3f)", total_loss / max(num_batches, 1), grad_norm_max)
-        _logger.info("Max CUDA memory: %.1f MB", torch.cuda.max_memory_allocated(dev) / 1024.0 ** 2)
+        if info_sums:
+            comps = "  ".join(f"{k}={v / max(num_batches, 1):.4e}" for k, v in info_sums.items())
+            _logger.info("Train component avgs: %s", comps)
+        if torch.cuda.is_available() and getattr(dev, "type", str(dev)) == "cuda":
+            _logger.info("Max CUDA memory: %.1f MB", torch.cuda.max_memory_allocated(dev) / 1024.0 ** 2)
         if scheduler and not getattr(scheduler, "_update_per_step", False):
             scheduler.step()
 
@@ -139,6 +158,9 @@ def make_evaluate_generative(input_key=None, cond_keys=None):
         total_loss = 0.0
         num_batches = 0
         count = 0
+        info_sums = {}
+
+        _postfix_keys = ("mf", "seal", "seal_lambda")
 
         # NB: MeanFlow loss needs grads enabled for JVP-via-autograd; with
         # torch.func.jvp we can skip torch.no_grad and use inference_mode.
@@ -154,11 +176,17 @@ def make_evaluate_generative(input_key=None, cond_keys=None):
                 num_batches += 1
                 count += num
                 total_loss += lv * num
-                tq.set_postfix({
-                    "Loss": "%.5f" % lv,
-                    "AvgLoss": "%.5f" % (total_loss / max(count, 1)),
-                    "MSE": "%.5f" % info.get("mse", float("nan")),
-                })
+                for k, v in info.items():
+                    info_sums[k] = info_sums.get(k, 0.0) + float(v) * num
+
+                postfix = {
+                    "Loss": "%.4f" % lv,
+                    "Avg": "%.4f" % (total_loss / max(count, 1)),
+                }
+                for k in _postfix_keys:
+                    if k in info:
+                        postfix[k] = "%.2e" % float(info[k])
+                tq.set_postfix(postfix)
                 if tb_helper and tb_helper.custom_fn:
                     tb_helper.custom_fn(model_output=None, model=model, epoch=epoch,
                                         i_batch=num_batches, mode="eval" if for_training else "test")
@@ -167,9 +195,15 @@ def make_evaluate_generative(input_key=None, cond_keys=None):
 
         avg = total_loss / max(count, 1)
         _logger.info("Eval AvgLoss: %.5f over %d entries", avg, count)
+        if info_sums:
+            comps = "  ".join(f"{k}={v / max(count, 1):.4e}" for k, v in info_sums.items())
+            _logger.info("Eval component avgs: %s", comps)
         if tb_helper:
             tb_mode = "eval" if for_training else "test"
-            tb_helper.write_scalars([(f"Loss/{tb_mode} (epoch)", avg, epoch)])
+            rows = [(f"Loss/{tb_mode} (epoch)", avg, epoch)]
+            for k, v in info_sums.items():
+                rows.append((f"{k}/{tb_mode} (epoch)", v / max(count, 1), epoch))
+            tb_helper.write_scalars(rows)
         if for_training:
             return avg
         # For prediction mode we don't have scores/labels in the

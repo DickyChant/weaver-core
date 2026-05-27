@@ -251,7 +251,6 @@ class SequenceTrimmer(nn.Module):
         self.num_extra_tokens = num_extra_tokens
         self.register_buffer("_counter", torch.LongTensor([0]), persistent=False)
 
-    @torch.compiler.disable
     def forward(self, x, v=None, mask=None, uu=None):
         # x: (N, C, P)
         # v: (N, 4, P) [px,py,pz,energy]

@@ -31,6 +31,10 @@ parser.add_argument('--best-metric-by', type=str, default='auto', choices=['auto
                          '`auto` (default) preserves existing behaviour: `min` if --regression-mode else `max`. '
                          'Use `min` for generative / loss-as-metric runs where lower is better; '
                          '`max` to force classifier-style higher-is-better even outside --regression-mode.')
+parser.add_argument('--seed', type=int, default=None,
+                    help='seed for torch / numpy / random / PYTHONHASHSEED. If unset, no explicit seeding '
+                         '(default-non-deterministic behaviour). Set to an int to make runs reproducible '
+                         'and to enable seed sweeps across replicates.')
 parser.add_argument('-c', '--data-config', type=str,
                     help='data config YAML file')
 parser.add_argument('--data-config-val', type=str, default=None,
@@ -990,6 +994,21 @@ def save_parquet(args, output_path, scores, labels, observers):
 
 def _main(args):
     _logger.info("args:\n - %s", "\n - ".join(str(it) for it in args.__dict__.items()))
+
+    # Optional global seeding. Done as early as possible so it covers data
+    # loaders, model init, augmentations, JVP RNG, everything. We deliberately
+    # don't toggle cudnn.deterministic / benchmark here -- those have a real
+    # throughput cost and most generative training is robust to non-deterministic
+    # cudnn kernels at the same seed.
+    if args.seed is not None:
+        import random as _random
+        os.environ.setdefault('PYTHONHASHSEED', str(args.seed))
+        _random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        _logger.info(f"Seeded torch/numpy/random/PYTHONHASHSEED with seed={args.seed}")
 
     # export to ONNX
     if args.export_onnx:

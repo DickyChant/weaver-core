@@ -198,6 +198,20 @@ class MeanFlowSEALLoss(nn.Module):
         # for the JetResiduals helper that matches the JetClass yaml layout.
         residual_func=None,
         lam_residual: float = 0.0,
+        # --- Where SEAL enforces equivariance --------------------------------
+        # "generator_endpoint" (default, original behaviour): constrain the
+        #   1-NFE generator f(z) = z - u(z, t=1, r=0, cond). This makes the
+        #   model equivariant ONLY at the (t=1, r=0) operating point. Multi-step
+        #   Euler sampling calls u at intermediate (t, r) that are NOT
+        #   constrained, so sampled-output equivariance erodes with step count.
+        # "velocity_sampled" (recommended for integrator-agnostic equivariance):
+        #   constrain the velocity field u(z, t, r, cond) itself at (t, r) drawn
+        #   from the sampling/time distribution. For LINEAR group actions R, an
+        #   equivariant velocity field gives EXACTLY equivariant explicit-Euler
+        #   sampling at any step count / schedule:
+        #       g(Rz) = Rz - h u(Rz,t,r) = R(z - h u(z,t,r)) = R g(z).
+        #   Over SGD steps the sampled (t, r) cover the whole trajectory.
+        seal_target: str = "generator_endpoint",
     ):
         super().__init__()
         assert group in ("lorentz", "so3"), group
@@ -206,7 +220,11 @@ class MeanFlowSEALLoss(nn.Module):
             raise ValueError("Lorentz generators are 4x4; set kin_dim=4 or use group='so3'")
         if group == "so3" and kin_dim not in (3, 4):
             raise ValueError("SO(3) wants kin_dim=3 (px,py,pz) or kin_dim=4 (E,px,py,pz, rotates spatial part)")
+        assert seal_target in ("generator_endpoint", "velocity_sampled"), seal_target
+        self.seal_target = seal_target
         self.meanflow = MeanFlowLoss(flow_ratio=flow_ratio, time_dist=time_dist, jvp_api=jvp_api)
+        self._flow_ratio = float(flow_ratio)
+        self._time_dist = tuple(time_dist)
         self.kin_start = int(kin_start)
         self.kin_dim = int(kin_dim)
         self.group = group
@@ -265,18 +283,28 @@ class MeanFlowSEALLoss(nn.Module):
         else:
             gens_use = gens
 
-        # 1-NFE generation function: f(z) = z - u(z, t=1, r=0, cond)
-        ones = torch.ones(data.shape[0], device=device, dtype=data.dtype)
-        zeros = torch.zeros(data.shape[0], device=device, dtype=data.dtype)
-
-        def gen_fn(z_):
-            v = model(z_, ones, zeros, *cond)
-            return z_ - v
-
         z = torch.randn_like(data)
+        if self.seal_target == "velocity_sampled":
+            # Constrain the velocity field u(z, t, r, cond) at (t, r) drawn from
+            # the sampling/time distribution. delta_seal_vector enforces
+            #   du/dz . (L z) == L . u(z, t, r)
+            # i.e. velocity-field equivariance. Integrator-agnostic (see ctor).
+            t_s, r_s = sample_t_r(data.shape[0], device, self._flow_ratio, self._time_dist)
+
+            def seal_fn(z_):
+                return model(z_, t_s, r_s, *cond)
+        else:
+            # generator_endpoint: 1-NFE map f(z) = z - u(z, t=1, r=0, cond).
+            ones = torch.ones(data.shape[0], device=device, dtype=data.dtype)
+            zeros = torch.zeros(data.shape[0], device=device, dtype=data.dtype)
+
+            def seal_fn(z_):
+                v = model(z_, ones, zeros, *cond)
+                return z_ - v
+
         with _sdpa_jvp_safe_ctx():
             seal_loss = delta_seal_vector(
-                gen_fn, z, gens_use, gens_out=gens_use,
+                seal_fn, z, gens_use, gens_out=gens_use,
                 take_mean=True, normalize=self.normalize_per_generator,
             )
 
@@ -288,6 +316,14 @@ class MeanFlowSEALLoss(nn.Module):
 
         if self.adaptive_lambda:
             with torch.no_grad():
+                # The loss module's buffers (seal_lambda/seal_ema/_step_count)
+                # are not moved to the GPU by weaver (it never calls .to(dev)
+                # on the loss). Migrate them to the loss tensor's device on
+                # first use so the in-place EMA update doesn't mix cpu+cuda.
+                if self.seal_ema.device != seal_loss.device:
+                    self.seal_ema = self.seal_ema.to(seal_loss.device)
+                    self.seal_lambda = self.seal_lambda.to(seal_loss.device)
+                    self._step_count = self._step_count.to(seal_loss.device)
                 seal_val = seal_loss.detach()
                 # EMA of the SEAL violation
                 self._step_count.add_(1)
@@ -311,15 +347,17 @@ class MeanFlowSEALLoss(nn.Module):
         info["seal_lambda"] = cur_lambda
 
         # --- PIDM-style residual on the 1-NFE generation -----------------
-        # Compute x_hat = gen_fn(z') with a FRESH noise z' (independent of the
-        # one used by SEAL, so the residual sees an unbiased sample) and feed
-        # to the residual_func. The model is differentiated through, so the
-        # residual gradient flows back into the velocity head. One extra
-        # forward per step when enabled.
+        # The residual always acts on the 1-NFE generation f(z') = z' - u(z',1,0)
+        # (the actual one-shot sample), independent of where SEAL is enforced.
+        # Fresh noise z' (independent of the SEAL z) so the residual sees an
+        # unbiased sample. The model is differentiated through, so the residual
+        # gradient flows back into the velocity head. One extra forward/step.
         if self.residual_func is not None and self.lam_residual > 0:
+            ones_r = torch.ones(data.shape[0], device=device, dtype=data.dtype)
+            zeros_r = torch.zeros(data.shape[0], device=device, dtype=data.dtype)
             z_res = torch.randn_like(data)
             with _sdpa_jvp_safe_ctx():
-                x_hat = gen_fn(z_res)
+                x_hat = z_res - model(z_res, ones_r, zeros_r, *cond)
             res_loss, res_info = self.residual_func(x_hat, mask, cond)
             total = total + self.lam_residual * res_loss
             info["residual"] = float(res_loss.detach())

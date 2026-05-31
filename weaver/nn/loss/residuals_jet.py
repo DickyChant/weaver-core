@@ -125,9 +125,10 @@ class JetResiduals(nn.Module):
         return E_sum, px_sum, py_sum, pz_sum, pt_sum, p_tot, mass
 
     def forward(self, x_hat: torch.Tensor, mask: torch.Tensor | None,
-                cond: Sequence[torch.Tensor]):
+                cond: Sequence[torch.Tensor], **kwargs):
         """x_hat: (B, F, N) generated, mask: (B, 1, N) or None,
-           cond: list/tuple of cond tensors (B, Ck, Mk). Uses cond[0] (pf_cond)."""
+           cond: list/tuple of cond tensors (B, Ck, Mk). Uses cond[0] (pf_cond).
+           **kwargs absorbs `real=` (used by 2-point PairwiseResiduals, ignored here)."""
         if not cond:
             return x_hat.new_zeros(()), {}
         c = cond[0]

@@ -358,7 +358,10 @@ class MeanFlowSEALLoss(nn.Module):
             z_res = torch.randn_like(data)
             with _sdpa_jvp_safe_ctx():
                 x_hat = z_res - model(z_res, ones_r, zeros_r, *cond)
-            res_loss, res_info = self.residual_func(x_hat, mask, cond)
+            # Pass the real batch through too. 1-point residuals (JetResiduals)
+            # ignore it via **kwargs; 2-point residuals (PairwiseResiduals)
+            # match the generated pairwise structure against `real`.
+            res_loss, res_info = self.residual_func(x_hat, mask, cond, real=data)
             total = total + self.lam_residual * res_loss
             info["residual"] = float(res_loss.detach())
             info["lam_residual"] = float(self.lam_residual)

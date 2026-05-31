@@ -84,12 +84,21 @@ class JetResiduals(nn.Module):
 
     @staticmethod
     def _untransform(c: torch.Tensor, layout: dict) -> torch.Tensor:
-        """Recover the physical value from a standardized cond column."""
+        """Recover the physical value from a standardized cond column.
+
+        Weaver standardizes inputs as `standardized = (raw - center) * scale`
+        (see weaver/utils/data/tools.py::_batched_fused_*_pad, `val = (val -
+        center) * scale_v`). The correct inverse is therefore
+            raw = standardized / scale + center
+        NOT `standardized * scale + center` (the original bug, which compressed
+        every target toward exp(center) and trained the residual to wrong
+        sum-rule targets).
+        """
         i = layout["index"]
         center = layout["center"]
         scale = layout["scale"]
         kind = layout["transform"]
-        u = c[:, i] * scale + center
+        u = c[:, i] / scale + center
         if kind == "log":
             return torch.exp(u)
         if kind == "log_offset":

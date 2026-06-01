@@ -212,6 +212,14 @@ class MeanFlowSEALLoss(nn.Module):
         #       g(Rz) = Rz - h u(Rz,t,r) = R(z - h u(z,t,r)) = R g(z).
         #   Over SGD steps the sampled (t, r) cover the whole trajectory.
         seal_target: str = "generator_endpoint",
+        # (t,r) sampling for seal_target="velocity_sampled":
+        #   "training"        -> sample_t_r (MeanFlow training distribution)
+        #   "sampler_matched" -> the Euler grid the sampler uses (recommended;
+        #                        constrains the velocity along the actual
+        #                        sampling trajectory). seal_sampler_steps sets
+        #                        the grid resolution (use the eval sample_steps).
+        seal_time_dist: str = "sampler_matched",
+        seal_sampler_steps: int = 10,
     ):
         super().__init__()
         assert group in ("lorentz", "so3"), group
@@ -221,7 +229,10 @@ class MeanFlowSEALLoss(nn.Module):
         if group == "so3" and kin_dim not in (3, 4):
             raise ValueError("SO(3) wants kin_dim=3 (px,py,pz) or kin_dim=4 (E,px,py,pz, rotates spatial part)")
         assert seal_target in ("generator_endpoint", "velocity_sampled"), seal_target
+        assert seal_time_dist in ("training", "sampler_matched"), seal_time_dist
         self.seal_target = seal_target
+        self._seal_time_dist = seal_time_dist
+        self._seal_sampler_steps = int(seal_sampler_steps)
         self.meanflow = MeanFlowLoss(flow_ratio=flow_ratio, time_dist=time_dist, jvp_api=jvp_api)
         self._flow_ratio = float(flow_ratio)
         self._time_dist = tuple(time_dist)
@@ -289,7 +300,28 @@ class MeanFlowSEALLoss(nn.Module):
             # the sampling/time distribution. delta_seal_vector enforces
             #   du/dz . (L z) == L . u(z, t, r)
             # i.e. velocity-field equivariance. Integrator-agnostic (see ctor).
-            t_s, r_s = sample_t_r(data.shape[0], device, self._flow_ratio, self._time_dist)
+            #
+            # CRUCIAL: the (t, r) for the SEAL term must match where the SAMPLER
+            # actually evaluates u, not the MeanFlow training distribution.
+            #   - "training"        : (t,r) ~ sample_t_r (lognorm, r=t 75% of the
+            #     time). This concentrates the constraint near t~0.5 and the
+            #     instantaneous r=t mode -- a region the multi-step sampler
+            #     barely visits. Empirically this FAILED to make 10-step
+            #     sampling equivariant (1-step 0.27, 10-step 0.21 ~ no-SEAL).
+            #   - "sampler_matched" : (t,r) drawn on the Euler grid the sampler
+            #     uses -- uniform t in (0,1], r = t - 1/steps (so r<t always,
+            #     never the trivial r=t mode). This constrains the velocity
+            #     exactly along the sampling trajectory.
+            B = data.shape[0]
+            if self._seal_time_dist == "sampler_matched":
+                steps = self._seal_sampler_steps
+                # pick a random step index k in [0, steps-1] per sample; t at the
+                # top of that interval, r at the bottom (matches euler_sample).
+                k = torch.randint(0, steps, (B,), device=device)
+                t_s = (1.0 - k.to(data.dtype) / steps)
+                r_s = (t_s - 1.0 / steps).clamp(min=0.0)
+            else:  # "training"
+                t_s, r_s = sample_t_r(B, device, self._flow_ratio, self._time_dist)
 
             def seal_fn(z_):
                 return model(z_, t_s, r_s, *cond)

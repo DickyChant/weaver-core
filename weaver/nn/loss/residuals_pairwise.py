@@ -74,20 +74,29 @@ def _pair_quantities(kin: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6):
 
 
 def _soft_hist(values: torch.Tensor, weights: torch.Tensor, edges: torch.Tensor,
-               tau: float = 0.5) -> torch.Tensor:
+               tau: float = 0.5, chunk: int = 1_000_000) -> torch.Tensor:
     """Differentiable soft histogram. values,weights: (B,N,N); edges: (K+1,).
     Returns (K,) batch-summed soft-binned weight, normalised to sum 1.
-    Soft assignment via a triangular/sigmoid kernel so gradients flow to values.
+    Soft assignment via a Gaussian kernel so gradients flow to values.
+
+    Chunked over the flattened pair dimension so the (M, K) soft-assignment
+    matrix never materialises all at once -- M = B*N*N can be ~4M for JetClass
+    (N=128, batch 256), which OOMs a 40 GB GPU at K=24 bins. `chunk` caps the
+    rows processed per step; gradients are identical to the unchunked version.
     """
     centers = 0.5 * (edges[:-1] + edges[1:])           # (K,)
     width = (edges[1] - edges[0]).clamp(min=1e-6)
-    v = values.reshape(-1, 1)                           # (M, 1)
-    w = weights.reshape(-1, 1)                           # (M, 1)
-    # soft bin membership: exp(-((v-c)/(tau*width))^2)
-    d = (v - centers.view(1, -1)) / (tau * width)
-    soft = torch.exp(-d * d)                             # (M, K)
-    soft = soft / soft.sum(dim=1, keepdim=True).clamp(min=1e-12)
-    hist = (soft * w).sum(dim=0)                         # (K,)
+    v = values.reshape(-1)                              # (M,)
+    w = weights.reshape(-1)                             # (M,)
+    K = centers.numel()
+    hist = values.new_zeros(K)
+    for i in range(0, v.numel(), chunk):
+        vi = v[i:i + chunk].unsqueeze(1)               # (m, 1)
+        wi = w[i:i + chunk].unsqueeze(1)               # (m, 1)
+        d = (vi - centers.view(1, -1)) / (tau * width)
+        soft = torch.exp(-d * d)                       # (m, K)
+        soft = soft / soft.sum(dim=1, keepdim=True).clamp(min=1e-12)
+        hist = hist + (soft * wi).sum(dim=0)
     return hist / hist.sum().clamp(min=1e-12)
 
 
@@ -111,8 +120,10 @@ class PairwiseResiduals(nn.Module):
         lndR_range=(-6.0, 1.0),
         metric: str = "chi2",
         weights: dict | None = None,
+        max_particles: int = 64,   # cap pairwise to top-|E| particles (memory)
     ):
         super().__init__()
+        self.max_particles = max_particles
         self.kin_slice = kin_slice
         self.kin_scale_inv = float(kin_scale_inv)
         self.observables = tuple(observables)
@@ -121,7 +132,23 @@ class PairwiseResiduals(nn.Module):
         self.register_buffer("lnm2_edges", torch.linspace(*lnm2_range, n_bins + 1))
         self.register_buffer("lndR_edges", torch.linspace(*lndR_range, n_bins + 1))
 
+    def _topk_by_energy(self, x, mask):
+        """Keep only the top `max_particles` by |E| per jet -- bounds the (N,N)
+        pairwise memory and is physically motivated (EEC is dominated by
+        high-energy particles). No-op if N <= max_particles."""
+        N = x.shape[-1]
+        if self.max_particles is None or N <= self.max_particles:
+            return x, mask
+        E = x[:, self.kin_slice.start].abs()           # (B, N) energy magnitude
+        if mask is not None:
+            E = E * mask.squeeze(1)
+        idx = E.topk(self.max_particles, dim=-1).indices  # (B, k)
+        xg = torch.gather(x, 2, idx.unsqueeze(1).expand(-1, x.shape[1], -1))
+        mg = torch.gather(mask, 2, idx.unsqueeze(1)) if mask is not None else None
+        return xg, mg
+
     def _hist_pair(self, x, mask, which):
+        x, mask = self._topk_by_energy(x, mask)
         kin = x[:, self.kin_slice] * self.kin_scale_inv
         lnm2, lndR, w = _pair_quantities(kin, mask)
         if which == "lnm2":

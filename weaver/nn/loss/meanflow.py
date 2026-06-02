@@ -220,6 +220,12 @@ class MeanFlowSEALLoss(nn.Module):
         #                        the grid resolution (use the eval sample_steps).
         seal_time_dist: str = "sampler_matched",
         seal_sampler_steps: int = 10,
+        # State at which to enforce velocity SEAL (see forward()):
+        #   "gaussian" (default, original) | "interpolant" | "trajectory".
+        # The diagnostic showed "gaussian" leaves the sampler's actual low-t
+        # states unconstrained; "interpolant"/"trajectory" fix the state mismatch.
+        seal_state: str = "gaussian",
+        seal_traj_steps: int = 5,
     ):
         super().__init__()
         assert group in ("lorentz", "so3"), group
@@ -230,9 +236,12 @@ class MeanFlowSEALLoss(nn.Module):
             raise ValueError("SO(3) wants kin_dim=3 (px,py,pz) or kin_dim=4 (E,px,py,pz, rotates spatial part)")
         assert seal_target in ("generator_endpoint", "velocity_sampled"), seal_target
         assert seal_time_dist in ("training", "sampler_matched"), seal_time_dist
+        assert seal_state in ("gaussian", "interpolant", "trajectory"), seal_state
         self.seal_target = seal_target
         self._seal_time_dist = seal_time_dist
         self._seal_sampler_steps = int(seal_sampler_steps)
+        self._seal_state = seal_state
+        self._seal_traj_steps = int(seal_traj_steps)
         self.meanflow = MeanFlowLoss(flow_ratio=flow_ratio, time_dist=time_dist, jvp_api=jvp_api)
         self._flow_ratio = float(flow_ratio)
         self._time_dist = tuple(time_dist)
@@ -294,6 +303,18 @@ class MeanFlowSEALLoss(nn.Module):
         else:
             gens_use = gens
 
+        # Choose the STATE at which to enforce SEAL. The diagnostic showed the
+        # velocity is equivariant at Gaussian z (~0.09) but the actual sampler
+        # visits states where violation explodes to ~0.55 at low t -- so
+        # constraining at Gaussian z (the default) leaves the sampler's true
+        # states unconstrained. seal_state picks a more representative state:
+        #   "gaussian"    : z ~ N(0,I)  (original; only matches the t=1 endpoint)
+        #   "interpolant" : z = (1-t)*data + t*eps  (the MeanFlow training state
+        #                   at time t -- the distribution the velocity is trained
+        #                   on, far closer to the sampler's states than Gaussian)
+        #   "trajectory"  : run a few no-grad Euler steps from Gaussian to reach
+        #                   the model's own z_k, then enforce SEAL there (closest
+        #                   to what the sampler actually evaluates).
         z = torch.randn_like(data)
         if self.seal_target == "velocity_sampled":
             # Constrain the velocity field u(z, t, r, cond) at (t, r) drawn from
@@ -322,6 +343,27 @@ class MeanFlowSEALLoss(nn.Module):
                 r_s = (t_s - 1.0 / steps).clamp(min=0.0)
             else:  # "training"
                 t_s, r_s = sample_t_r(B, device, self._flow_ratio, self._time_dist)
+
+            # Build the SEAL state z to match where the sampler evaluates u.
+            t_col = _expand_like(t_s, data)
+            if self._seal_state == "interpolant":
+                eps = torch.randn_like(data)
+                z = (1.0 - t_col) * data + t_col * eps
+            elif self._seal_state == "trajectory":
+                # No-grad Euler from Gaussian down to t_s (per-sample target t).
+                with torch.no_grad(), _sdpa_jvp_safe_ctx():
+                    zt = torch.randn_like(data)
+                    n_pre = int(self._seal_traj_steps)
+                    tv = torch.linspace(1.0, 0.0, n_pre + 1, device=device)
+                    for j in range(n_pre):
+                        tj = torch.full((B,), tv[j].item(), device=device, dtype=data.dtype)
+                        rj = torch.full((B,), tv[j + 1].item(), device=device, dtype=data.dtype)
+                        # only advance samples whose target t_s is below tj
+                        v = model(zt, tj, rj, *cond)
+                        step_mask = (t_s < tj).view(-1, *([1] * (data.ndim - 1))).to(data.dtype)
+                        zt = zt - step_mask * (tj - rj).view(-1, *([1] * (data.ndim - 1))) * v
+                z = zt.detach()
+            # else "gaussian": keep z = randn already set above
 
             def seal_fn(z_):
                 return model(z_, t_s, r_s, *cond)

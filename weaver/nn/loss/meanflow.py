@@ -198,6 +198,15 @@ class MeanFlowSEALLoss(nn.Module):
         # for the JetResiduals helper that matches the JetClass yaml layout.
         residual_func=None,
         lam_residual: float = 0.0,
+        # Where the residual is enforced. By default (=1) the residual acts on
+        # the 1-NFE generation f(z) = z - u(z, 1, 0) -- the same state mismatch
+        # SEAL suffers: it constrains the one-shot sample, NOT the states the
+        # K-step Euler sampler actually visits. Set > 1 to instead generate via
+        # a `residual_sample_steps`-step Euler rollout (WITH grad) and enforce
+        # the residual on THAT multi-step sample, so the physics constraint
+        # matches what we evaluate. Costs `residual_sample_steps` extra forward
+        # passes with backprop through the whole rollout.
+        residual_sample_steps: int = 1,
         # --- Where SEAL enforces equivariance --------------------------------
         # "generator_endpoint" (default, original behaviour): constrain the
         #   1-NFE generator f(z) = z - u(z, t=1, r=0, cond). This makes the
@@ -226,6 +235,8 @@ class MeanFlowSEALLoss(nn.Module):
         # states unconstrained; "interpolant"/"trajectory" fix the state mismatch.
         seal_state: str = "gaussian",
         seal_traj_steps: int = 5,
+        combined_w_endpoint: float = 1.0,
+        combined_w_velocity: float = 1.0,
     ):
         super().__init__()
         assert group in ("lorentz", "so3"), group
@@ -234,7 +245,7 @@ class MeanFlowSEALLoss(nn.Module):
             raise ValueError("Lorentz generators are 4x4; set kin_dim=4 or use group='so3'")
         if group == "so3" and kin_dim not in (3, 4):
             raise ValueError("SO(3) wants kin_dim=3 (px,py,pz) or kin_dim=4 (E,px,py,pz, rotates spatial part)")
-        assert seal_target in ("generator_endpoint", "velocity_sampled"), seal_target
+        assert seal_target in ("generator_endpoint", "velocity_sampled", "endpoint_sampled", "combined"), seal_target
         assert seal_time_dist in ("training", "sampler_matched"), seal_time_dist
         assert seal_state in ("gaussian", "interpolant", "trajectory"), seal_state
         self.seal_target = seal_target
@@ -242,6 +253,8 @@ class MeanFlowSEALLoss(nn.Module):
         self._seal_sampler_steps = int(seal_sampler_steps)
         self._seal_state = seal_state
         self._seal_traj_steps = int(seal_traj_steps)
+        self._combined_w_endpoint = float(combined_w_endpoint)
+        self._combined_w_velocity = float(combined_w_velocity)
         self.meanflow = MeanFlowLoss(flow_ratio=flow_ratio, time_dist=time_dist, jvp_api=jvp_api)
         self._flow_ratio = float(flow_ratio)
         self._time_dist = tuple(time_dist)
@@ -270,6 +283,7 @@ class MeanFlowSEALLoss(nn.Module):
         # callable; if it is an nn.Module it gets registered via setattr.
         self.residual_func = residual_func
         self.lam_residual = float(lam_residual)
+        self.residual_sample_steps = int(residual_sample_steps)
 
     def _build_generators(self, feature_dim: int, device, dtype):
         if self.group == "lorentz":
@@ -315,72 +329,97 @@ class MeanFlowSEALLoss(nn.Module):
         #   "trajectory"  : run a few no-grad Euler steps from Gaussian to reach
         #                   the model's own z_k, then enforce SEAL there (closest
         #                   to what the sampler actually evaluates).
-        z = torch.randn_like(data)
-        if self.seal_target == "velocity_sampled":
-            # Constrain the velocity field u(z, t, r, cond) at (t, r) drawn from
-            # the sampling/time distribution. delta_seal_vector enforces
-            #   du/dz . (L z) == L . u(z, t, r)
-            # i.e. velocity-field equivariance. Integrator-agnostic (see ctor).
-            #
-            # CRUCIAL: the (t, r) for the SEAL term must match where the SAMPLER
-            # actually evaluates u, not the MeanFlow training distribution.
-            #   - "training"        : (t,r) ~ sample_t_r (lognorm, r=t 75% of the
-            #     time). This concentrates the constraint near t~0.5 and the
-            #     instantaneous r=t mode -- a region the multi-step sampler
-            #     barely visits. Empirically this FAILED to make 10-step
-            #     sampling equivariant (1-step 0.27, 10-step 0.21 ~ no-SEAL).
-            #   - "sampler_matched" : (t,r) drawn on the Euler grid the sampler
-            #     uses -- uniform t in (0,1], r = t - 1/steps (so r<t always,
-            #     never the trivial r=t mode). This constrains the velocity
-            #     exactly along the sampling trajectory.
-            B = data.shape[0]
-            if self._seal_time_dist == "sampler_matched":
-                steps = self._seal_sampler_steps
-                # pick a random step index k in [0, steps-1] per sample; t at the
-                # top of that interval, r at the bottom (matches euler_sample).
-                k = torch.randint(0, steps, (B,), device=device)
-                t_s = (1.0 - k.to(data.dtype) / steps)
-                r_s = (t_s - 1.0 / steps).clamp(min=0.0)
-            else:  # "training"
-                t_s, r_s = sample_t_r(B, device, self._flow_ratio, self._time_dist)
+        # Build (seal_fn, z) for one target spec. Factored out so the "combined"
+        # target can enforce two operating points in one step.
+        def _build_seal(target):
+            Bb = data.shape[0]
+            if target == "velocity_sampled":
+                # Velocity-field equivariance du/dz.(Lz)==L.u(z,t,r) at the (t,r)
+                # the SAMPLER evaluates. sampler_matched: t on the Euler grid,
+                # r = t - 1/steps (the actual step). This is the variant that
+                # empirically recovers multi-step equivariance.
+                if self._seal_time_dist == "sampler_matched":
+                    steps = self._seal_sampler_steps
+                    k = torch.randint(0, steps, (Bb,), device=device)
+                    t_s = (1.0 - k.to(data.dtype) / steps)
+                    r_s = (t_s - 1.0 / steps).clamp(min=0.0)
+                else:
+                    t_s, r_s = sample_t_r(Bb, device, self._flow_ratio, self._time_dist)
+                t_col = _expand_like(t_s, data)
+                if self._seal_state == "interpolant":
+                    eps = torch.randn_like(data)
+                    zz = (1.0 - t_col) * data + t_col * eps
+                elif self._seal_state == "trajectory":
+                    with torch.no_grad(), _sdpa_jvp_safe_ctx():
+                        zt = torch.randn_like(data)
+                        n_pre = int(self._seal_traj_steps)
+                        tv = torch.linspace(1.0, 0.0, n_pre + 1, device=device)
+                        for j in range(n_pre):
+                            tj = torch.full((Bb,), tv[j].item(), device=device, dtype=data.dtype)
+                            rj = torch.full((Bb,), tv[j + 1].item(), device=device, dtype=data.dtype)
+                            v = model(zt, tj, rj, *cond)
+                            step_mask = (t_s < tj).view(-1, *([1] * (data.ndim - 1))).to(data.dtype)
+                            zt = zt - step_mask * (tj - rj).view(-1, *([1] * (data.ndim - 1))) * v
+                    zz = zt.detach()
+                else:
+                    zz = torch.randn_like(data)
 
-            # Build the SEAL state z to match where the sampler evaluates u.
-            t_col = _expand_like(t_s, data)
-            if self._seal_state == "interpolant":
-                eps = torch.randn_like(data)
-                z = (1.0 - t_col) * data + t_col * eps
-            elif self._seal_state == "trajectory":
-                # No-grad Euler from Gaussian down to t_s (per-sample target t).
-                with torch.no_grad(), _sdpa_jvp_safe_ctx():
-                    zt = torch.randn_like(data)
-                    n_pre = int(self._seal_traj_steps)
-                    tv = torch.linspace(1.0, 0.0, n_pre + 1, device=device)
-                    for j in range(n_pre):
-                        tj = torch.full((B,), tv[j].item(), device=device, dtype=data.dtype)
-                        rj = torch.full((B,), tv[j + 1].item(), device=device, dtype=data.dtype)
-                        # only advance samples whose target t_s is below tj
-                        v = model(zt, tj, rj, *cond)
-                        step_mask = (t_s < tj).view(-1, *([1] * (data.ndim - 1))).to(data.dtype)
-                        zt = zt - step_mask * (tj - rj).view(-1, *([1] * (data.ndim - 1))) * v
-                z = zt.detach()
-            # else "gaussian": keep z = randn already set above
+                def fn(z_):
+                    return model(z_, t_s, r_s, *cond)
+                return fn, zz
+            elif target == "endpoint_sampled":
+                # Endpoint estimate at every t: x_hat = z_t - t*u(z_t,t,0). Helps
+                # the 1-NFE (r=0) operating point across all t; does NOT transfer
+                # to the multi-step sampler (wrong r) -- see the combined target.
+                if self._seal_time_dist == "sampler_matched":
+                    steps = self._seal_sampler_steps
+                    k = torch.randint(0, steps, (Bb,), device=device)
+                    t_s = (1.0 - k.to(data.dtype) / steps).clamp(min=1.0 / steps)
+                else:
+                    t_s, _r = sample_t_r(Bb, device, self._flow_ratio, self._time_dist)
+                zeros = torch.zeros(Bb, device=device, dtype=data.dtype)
+                t_col = _expand_like(t_s, data)
+                if self._seal_state == "gaussian":
+                    zz = torch.randn_like(data)
+                else:
+                    eps = torch.randn_like(data)
+                    zz = (1.0 - t_col) * data + t_col * eps
 
-            def seal_fn(z_):
-                return model(z_, t_s, r_s, *cond)
+                def fn(z_):
+                    v = model(z_, t_s, zeros, *cond)
+                    return z_ - t_col * v
+                return fn, zz
+            else:  # generator_endpoint: 1-NFE map f(z) = z - u(z,1,0,cond)
+                ones = torch.ones(Bb, device=device, dtype=data.dtype)
+                zeros = torch.zeros(Bb, device=device, dtype=data.dtype)
+
+                def fn(z_):
+                    return z_ - model(z_, ones, zeros, *cond)
+                return fn, torch.randn_like(data)
+
+        seal_parts = {}
+        if self.seal_target == "combined":
+            # Operating-point locality showed each single constraint helps only
+            # its own operating point (endpoint -> 1-step; sampler-matched
+            # velocity -> multi-step). Enforce BOTH so the generator can be
+            # equivariant at 1-NFE AND under multi-step sampling. The velocity
+            # part uses seal_state (interpolant) + sampler_matched time.
+            with _sdpa_jvp_safe_ctx():
+                fn_e, z_e = _build_seal("generator_endpoint")
+                sl_e = delta_seal_vector(fn_e, z_e, gens_use, gens_out=gens_use,
+                                         take_mean=True, normalize=self.normalize_per_generator)
+                fn_v, z_v = _build_seal("velocity_sampled")
+                sl_v = delta_seal_vector(fn_v, z_v, gens_use, gens_out=gens_use,
+                                         take_mean=True, normalize=self.normalize_per_generator)
+            seal_loss = self._combined_w_endpoint * sl_e + self._combined_w_velocity * sl_v
+            seal_parts = {"seal_endpoint": float(sl_e.detach()), "seal_velocity": float(sl_v.detach())}
         else:
-            # generator_endpoint: 1-NFE map f(z) = z - u(z, t=1, r=0, cond).
-            ones = torch.ones(data.shape[0], device=device, dtype=data.dtype)
-            zeros = torch.zeros(data.shape[0], device=device, dtype=data.dtype)
-
-            def seal_fn(z_):
-                v = model(z_, ones, zeros, *cond)
-                return z_ - v
-
-        with _sdpa_jvp_safe_ctx():
-            seal_loss = delta_seal_vector(
-                seal_fn, z, gens_use, gens_out=gens_use,
-                take_mean=True, normalize=self.normalize_per_generator,
-            )
+            seal_fn, z = _build_seal(self.seal_target)
+            with _sdpa_jvp_safe_ctx():
+                seal_loss = delta_seal_vector(
+                    seal_fn, z, gens_use, gens_out=gens_use,
+                    take_mean=True, normalize=self.normalize_per_generator,
+                )
 
         # Pull the current lambda as a plain Python float so it doesn't
         # accumulate into the autograd graph; we apply gradients to model
@@ -418,6 +457,7 @@ class MeanFlowSEALLoss(nn.Module):
 
         info["seal"] = float(seal_loss.detach())
         info["seal_n_gens"] = int(gens_use.shape[0])
+        info.update(seal_parts)
         info["seal_lambda"] = cur_lambda
 
         # --- PIDM-style residual on the 1-NFE generation -----------------
@@ -427,11 +467,27 @@ class MeanFlowSEALLoss(nn.Module):
         # unbiased sample. The model is differentiated through, so the residual
         # gradient flows back into the velocity head. One extra forward/step.
         if self.residual_func is not None and self.lam_residual > 0:
-            ones_r = torch.ones(data.shape[0], device=device, dtype=data.dtype)
-            zeros_r = torch.zeros(data.shape[0], device=device, dtype=data.dtype)
             z_res = torch.randn_like(data)
+            K = self.residual_sample_steps
             with _sdpa_jvp_safe_ctx():
-                x_hat = z_res - model(z_res, ones_r, zeros_r, *cond)
+                if K <= 1:
+                    # 1-NFE generation -- the operating point the residual was
+                    # historically enforced at. Works at 1-step but does NOT
+                    # transfer to multi-step sampling (state mismatch).
+                    ones_r = torch.ones(data.shape[0], device=device, dtype=data.dtype)
+                    zeros_r = torch.zeros(data.shape[0], device=device, dtype=data.dtype)
+                    x_hat = z_res - model(z_res, ones_r, zeros_r, *cond)
+                else:
+                    # Sampler-matched: run a K-step Euler rollout WITH grad so
+                    # the residual constrains the actual multi-step sample. Same
+                    # time grid as euler_sample (1 -> 0 over K+1 points).
+                    t_grid = torch.linspace(1.0, 0.0, K + 1, device=device, dtype=data.dtype)
+                    x_hat = z_res
+                    for i in range(K):
+                        ti = torch.full((data.shape[0],), float(t_grid[i]), device=device, dtype=data.dtype)
+                        ri = torch.full((data.shape[0],), float(t_grid[i + 1]), device=device, dtype=data.dtype)
+                        v = model(x_hat, ti, ri, *cond)
+                        x_hat = x_hat - _expand_like(ti - ri, x_hat) * v
             # Pass the real batch through too. 1-point residuals (JetResiduals)
             # ignore it via **kwargs; 2-point residuals (PairwiseResiduals)
             # match the generated pairwise structure against `real`.

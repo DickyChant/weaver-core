@@ -207,6 +207,9 @@ class MeanFlowSEALLoss(nn.Module):
         # matches what we evaluate. Costs `residual_sample_steps` extra forward
         # passes with backprop through the whole rollout.
         residual_sample_steps: int = 1,
+        residual_combined: bool = False,
+        residual_w_endpoint: float = 1.0,
+        residual_w_sampler: float = 1.0,
         # --- Where SEAL enforces equivariance --------------------------------
         # "generator_endpoint" (default, original behaviour): constrain the
         #   1-NFE generator f(z) = z - u(z, t=1, r=0, cond). This makes the
@@ -284,6 +287,9 @@ class MeanFlowSEALLoss(nn.Module):
         self.residual_func = residual_func
         self.lam_residual = float(lam_residual)
         self.residual_sample_steps = int(residual_sample_steps)
+        self.residual_combined = bool(residual_combined)
+        self.residual_w_endpoint = float(residual_w_endpoint)
+        self.residual_w_sampler = float(residual_w_sampler)
 
     def _build_generators(self, feature_dim: int, device, dtype):
         if self.group == "lorentz":
@@ -467,31 +473,38 @@ class MeanFlowSEALLoss(nn.Module):
         # unbiased sample. The model is differentiated through, so the residual
         # gradient flows back into the velocity head. One extra forward/step.
         if self.residual_func is not None and self.lam_residual > 0:
-            z_res = torch.randn_like(data)
-            K = self.residual_sample_steps
-            with _sdpa_jvp_safe_ctx():
+            # Generate the sample the residual acts on, via a K-step Euler rollout
+            # (K=1 is the 1-NFE endpoint). Differentiable through the model.
+            def _residual_rollout(K):
+                z_res = torch.randn_like(data)
                 if K <= 1:
-                    # 1-NFE generation -- the operating point the residual was
-                    # historically enforced at. Works at 1-step but does NOT
-                    # transfer to multi-step sampling (state mismatch).
                     ones_r = torch.ones(data.shape[0], device=device, dtype=data.dtype)
                     zeros_r = torch.zeros(data.shape[0], device=device, dtype=data.dtype)
-                    x_hat = z_res - model(z_res, ones_r, zeros_r, *cond)
+                    return z_res - model(z_res, ones_r, zeros_r, *cond)
+                t_grid = torch.linspace(1.0, 0.0, K + 1, device=device, dtype=data.dtype)
+                x_hat = z_res
+                for i in range(K):
+                    ti = torch.full((data.shape[0],), float(t_grid[i]), device=device, dtype=data.dtype)
+                    ri = torch.full((data.shape[0],), float(t_grid[i + 1]), device=device, dtype=data.dtype)
+                    v = model(x_hat, ti, ri, *cond)
+                    x_hat = x_hat - _expand_like(ti - ri, x_hat) * v
+                return x_hat
+
+            with _sdpa_jvp_safe_ctx():
+                if self.residual_combined:
+                    # Physics analogue of the combined SEAL fix: enforce the
+                    # residual at BOTH the 1-NFE endpoint AND the K-step rollout,
+                    # so the sum rule holds at 1-step and at the matched grid.
+                    x_ep = _residual_rollout(1)
+                    x_k = _residual_rollout(self.residual_sample_steps)
+                    res_ep, res_info = self.residual_func(x_ep, mask, cond, real=data)
+                    res_k, _rk_info = self.residual_func(x_k, mask, cond, real=data)
+                    res_loss = self.residual_w_endpoint * res_ep + self.residual_w_sampler * res_k
+                    info["residual_endpoint"] = float(res_ep.detach())
+                    info["residual_sampler"] = float(res_k.detach())
                 else:
-                    # Sampler-matched: run a K-step Euler rollout WITH grad so
-                    # the residual constrains the actual multi-step sample. Same
-                    # time grid as euler_sample (1 -> 0 over K+1 points).
-                    t_grid = torch.linspace(1.0, 0.0, K + 1, device=device, dtype=data.dtype)
-                    x_hat = z_res
-                    for i in range(K):
-                        ti = torch.full((data.shape[0],), float(t_grid[i]), device=device, dtype=data.dtype)
-                        ri = torch.full((data.shape[0],), float(t_grid[i + 1]), device=device, dtype=data.dtype)
-                        v = model(x_hat, ti, ri, *cond)
-                        x_hat = x_hat - _expand_like(ti - ri, x_hat) * v
-            # Pass the real batch through too. 1-point residuals (JetResiduals)
-            # ignore it via **kwargs; 2-point residuals (PairwiseResiduals)
-            # match the generated pairwise structure against `real`.
-            res_loss, res_info = self.residual_func(x_hat, mask, cond, real=data)
+                    x_hat = _residual_rollout(self.residual_sample_steps)
+                    res_loss, res_info = self.residual_func(x_hat, mask, cond, real=data)
             total = total + self.lam_residual * res_loss
             info["residual"] = float(res_loss.detach())
             info["lam_residual"] = float(self.lam_residual)

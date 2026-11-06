@@ -232,6 +232,13 @@ class MeanFlowSEALLoss(nn.Module):
         #                        the grid resolution (use the eval sample_steps).
         seal_time_dist: str = "sampler_matched",
         seal_sampler_steps: int = 10,
+        # K-MARGINAL enforcement: if set to a tuple/list of step counts (e.g.
+        # (2, 4, 10, 20)), the sampler-matched velocity term draws a per-sample
+        # step count K from this set each batch, so the constraint covers the
+        # WHOLE sampler-grid family instead of a single fixed K. This tests
+        # operating-point-DISTRIBUTED enforcement (robust across all K) vs. the
+        # sharp single-K "combined" fix. None -> original single-K behaviour.
+        seal_sampler_steps_set=None,
         # State at which to enforce velocity SEAL (see forward()):
         #   "gaussian" (default, original) | "interpolant" | "trajectory".
         # The diagnostic showed "gaussian" leaves the sampler's actual low-t
@@ -254,6 +261,10 @@ class MeanFlowSEALLoss(nn.Module):
         self.seal_target = seal_target
         self._seal_time_dist = seal_time_dist
         self._seal_sampler_steps = int(seal_sampler_steps)
+        self._seal_sampler_steps_set = (
+            tuple(int(s) for s in seal_sampler_steps_set)
+            if seal_sampler_steps_set else None
+        )
         self._seal_state = seal_state
         self._seal_traj_steps = int(seal_traj_steps)
         self._combined_w_endpoint = float(combined_w_endpoint)
@@ -345,10 +356,22 @@ class MeanFlowSEALLoss(nn.Module):
                 # r = t - 1/steps (the actual step). This is the variant that
                 # empirically recovers multi-step equivariance.
                 if self._seal_time_dist == "sampler_matched":
-                    steps = self._seal_sampler_steps
-                    k = torch.randint(0, steps, (Bb,), device=device)
-                    t_s = (1.0 - k.to(data.dtype) / steps)
-                    r_s = (t_s - 1.0 / steps).clamp(min=0.0)
+                    if self._seal_sampler_steps_set is not None:
+                        # K-marginal: per-sample step count drawn from the set, so
+                        # the constraint spans the whole family of Euler grids (all
+                        # K) rather than one fixed grid -> robust across sampling
+                        # budgets instead of sharp at a single K.
+                        choices = torch.tensor(self._seal_sampler_steps_set,
+                                               device=device, dtype=data.dtype)
+                        steps = choices[torch.randint(0, len(choices), (Bb,), device=device)]
+                        k = (torch.rand(Bb, device=device) * steps).floor()  # k in [0, steps)
+                        t_s = (1.0 - k / steps)
+                        r_s = (t_s - 1.0 / steps).clamp(min=0.0)
+                    else:
+                        steps = self._seal_sampler_steps
+                        k = torch.randint(0, steps, (Bb,), device=device)
+                        t_s = (1.0 - k.to(data.dtype) / steps)
+                        r_s = (t_s - 1.0 / steps).clamp(min=0.0)
                 else:
                     t_s, r_s = sample_t_r(Bb, device, self._flow_ratio, self._time_dist)
                 t_col = _expand_like(t_s, data)

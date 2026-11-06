@@ -158,6 +158,8 @@ class MeanFlowParT(nn.Module):
 
         Returns velocity prediction of shape (B, F, N).
         """
+        if getattr(self, "cfm_mode", False):
+            r = t  # pure flow-matching control: instantaneous velocity u(z,t,t) everywhere
         x = self._build_input(z, t, r, cond)
         v_4vec = None
         if self.use_pair_features:

@@ -168,9 +168,9 @@ def make_evaluate_generative(input_key=None, cond_keys=None):
 
         _postfix_keys = ("mf", "seal", "seal_lambda")
 
-        # NB: MeanFlow loss needs grads enabled for JVP-via-autograd; with
-        # torch.func.jvp we can skip torch.no_grad and use inference_mode.
-        with tqdm.tqdm(test_loader) as tq:
+        # Disable reverse-mode recording while preserving forward-mode JVPs.
+        # inference_mode also disables forward-mode AD and must not be used here.
+        with torch.no_grad(), tqdm.tqdm(test_loader) as tq:
             for X, _y, _Z in tq:
                 data, cond, mask = _select_inputs(X, data_config, input_key, cond_keys)
                 data = data.to(dev)
